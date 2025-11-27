@@ -14,6 +14,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     FSInputFile,
+    WebAppInfo,
 )
 from aiogram.client.default import DefaultBotProperties
 
@@ -162,11 +163,7 @@ def _tenant_pb_code(tenant: Tenant) -> str:
     """
     Короткий код для постбэков:
     tn1, tn2, tn3 ...
-    Если в базе есть pb_secret — можно использовать его,
-    но по умолчанию tn{id}.
     """
-    if tenant.pb_secret:
-        return tenant.pb_secret
     return f"tn{tenant.id}"
 
 
@@ -392,8 +389,13 @@ access_welcome_shown: set[tuple[int, int]] = set()
 # пользовательское меню + онбординг
 # ---------------------------------------------------------------------------
 
-def _build_main_menu_kb(tenant: Tenant, lang: str) -> InlineKeyboardMarkup:
+def _build_main_menu_kb(
+    tenant: Tenant,
+    lang: str,
+    full_access: bool,
+) -> InlineKeyboardMarkup:
     support_url = tenant.support_url or settings.default_support_url
+    miniapp_url = settings.miniapp_url or "https://jeempocket.github.io/mini-app/"
 
     row1 = [
         InlineKeyboardButton(
@@ -417,12 +419,21 @@ def _build_main_menu_kb(tenant: Tenant, lang: str) -> InlineKeyboardMarkup:
         )
     )
 
-    row3 = [
-        InlineKeyboardButton(
-            text=t_user(lang, "btn_signal"),
-            callback_data="menu:signal",
-        )
-    ]
+    # Если доступ открыт — сразу web_app, иначе запускаем онбординг
+    if full_access:
+        row3 = [
+            InlineKeyboardButton(
+                text=t_user(lang, "btn_signal"),
+                web_app=WebAppInfo(url=miniapp_url),
+            )
+        ]
+    else:
+        row3 = [
+            InlineKeyboardButton(
+                text=t_user(lang, "btn_signal"),
+                callback_data="menu:signal",
+            )
+        ]
 
     return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3])
 
@@ -497,10 +508,29 @@ async def _send_main_menu(message: Message, tenant_id: int, lang: str) -> None:
         await message.answer("Configuration error: tenant not found.")
         return
 
-    text = f"{t_user(lang, 'menu_title')}\n\n{t_user(lang, 'menu_body')}"
-    kb = _build_main_menu_kb(tenant, lang)
-    await _send_screen_with_photo(message, lang, "menu", text, kb)
+    # по умолчанию считаем, что доступа нет
+    full_access = False
+    user = message.from_user
 
+    if user is not None:
+        ua = await _get_or_create_access(
+            tenant_id=tenant_id,
+            user_id=user.id,
+            username=user.username,
+        )
+
+        # логика полного доступа:
+        # если проверяем депозит — нужен и флаг регистрации, и флаг депозита
+        if tenant.check_deposit:
+            full_access = ua.is_registered and ua.has_deposit
+        else:
+            # если депозит не проверяем, можно доработать на основе подписки,
+            # пока считаем, что через главное меню онбординг всё равно стартует
+            full_access = False
+
+    text = f"{t_user(lang, 'menu_title')}\n\n{t_user(lang, 'menu_body')}"
+    kb = _build_main_menu_kb(tenant, lang, full_access)
+    await _send_screen_with_photo(message, lang, "menu", text, kb)
 
 async def _send_instruction(message: Message, lang: str) -> None:
     text = f"{t_user(lang, 'instruction_title')}\n\n{t_user(lang, 'instruction_body')}"
@@ -633,11 +663,13 @@ async def _send_access_open_screen(
     lang: str,
 ) -> None:
     support_url = tenant.support_url or settings.default_support_url
+    miniapp_url = settings.miniapp_url or "https://jeempocket.github.io/mini-app/"
+
     text = f"{t_user(lang, 'access_title')}\n\n{t_user(lang, 'access_body')}"
     row1 = [
         InlineKeyboardButton(
             text=t_user(lang, "btn_open_app"),
-            callback_data="signal:open_app",
+            web_app=WebAppInfo(url=miniapp_url),
         )
     ]
     row2: List[InlineKeyboardButton] = []
@@ -660,10 +692,22 @@ async def _send_access_open_screen(
 
 async def _open_miniapp(message: Message, lang: str) -> None:
     """
-    В будущем здесь будет запуск мини-аппа (web_app).
-    Пока — заглушка.
+    Открываем мини-апп через web_app кнопку.
     """
-    await message.answer(t_user(lang, "signal_coming_soon"))
+    url = settings.miniapp_url or "https://jeempocket.github.io/mini-app/"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=t_user(lang, "btn_open_app"),
+                    web_app=WebAppInfo(url=url),
+                )
+            ]
+        ]
+    )
+
+    await message.answer(t_user(lang, "signal_coming_soon"), reply_markup=kb)
 
 
 async def _handle_signal_flow(
@@ -705,8 +749,8 @@ async def _handle_signal_flow(
         if key not in access_welcome_shown:
             access_welcome_shown.add(key)
             await _send_access_open_screen(message, tenant, lang)
-        else:
-            await _open_miniapp(message, lang)
+        # иначе просто ничего не шлём — доступ уже открыт,
+        # в главном меню кнопка "Получить сигнал" сразу открывает мини-апп
         return
 
     # 1) Подписка, если включена
@@ -1038,18 +1082,13 @@ async def _admin_toggle_param(tenant_id: int, field: str) -> bool:
 
 
 def _build_links_text(tenant: Tenant) -> str:
-    pb_secret = tenant.pb_secret or "—"
-    if pb_secret != "—" and len(pb_secret) > 6:
-        pb_secret = pb_secret[:3] + "***" + pb_secret[-3:]
-
     return (
         f"{t_admin('links_header')}\n\n"
         f"Реф ссылка: {tenant.ref_link or '—'}\n"
         f"Ссылка на депозит: {tenant.deposit_link or '—'}\n"
         f"URL поддержки: {tenant.support_url or settings.default_support_url or '—'}\n"
         f"ID канала: <code>{tenant.gate_channel_id or '—'}</code>\n"
-        f"URL канала: {tenant.gate_channel_url or '—'}\n"
-        f"PB secret: <code>{pb_secret}</code>\n\n"
+        f"URL канала: {tenant.gate_channel_url or '—'}\n\n"
         "Чтобы очистить поле, отправь «-» (дефис)."
     )
 
@@ -1346,7 +1385,7 @@ async def _admin_show_stats(call: CallbackQuery, tenant_id: int) -> None:
         )
         total_amount, count = (await session.execute(q)).one()
 
-    subs = total_users  # сюда попадают только прошедшие подписку
+    subs = total_users  # формально тут те, кто дошёл до бота
 
     text = (
         f"{t_admin('stats_header')}\n\n"

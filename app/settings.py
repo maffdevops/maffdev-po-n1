@@ -36,6 +36,12 @@ class Settings(BaseModel):
         alias="CLICK_SALT",
     )
 
+    # URL мини-аппа
+    miniapp_url: Optional[str] = Field(
+        default=None,
+        alias="MINIAPP_URL",
+    )
+
     @staticmethod
     def _parse_int_list(value: str | None) -> list[int]:
         """Парсим строку вида '1,2,3' в список [1, 2, 3]."""
@@ -64,6 +70,7 @@ class Settings(BaseModel):
                 "CLICK_SALT",
                 "change_me_to_random_secure_string",
             ),
+            "MINIAPP_URL": os.getenv("MINIAPP_URL"),
         }
 
         # Отдельно парсим GA_ADMIN_IDS

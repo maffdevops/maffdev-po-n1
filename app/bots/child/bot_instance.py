@@ -668,11 +668,11 @@ async def _send_access_open_screen(
     text = f"{t_user(lang, 'access_title')}\n\n{t_user(lang, 'access_body')}"
     row1 = [
         InlineKeyboardButton(
-            text=t_user(lang, "btn_open_app"),
+            text=t_user(lang, "btn_open_app"),  # текст типа "Получить сигнал"
             web_app=WebAppInfo(url=miniapp_url),
         )
     ]
-    row2: List[InlineKeyboardButton] = []
+    row2: list[InlineKeyboardButton] = []
     if support_url:
         row2.append(
             InlineKeyboardButton(
@@ -686,29 +686,18 @@ async def _send_access_open_screen(
             callback_data="menu:back",
         )
     )
+
     kb = InlineKeyboardMarkup(inline_keyboard=[row1, row2])
     await _send_screen_with_photo(message, lang, "access", text, kb)
 
 
 async def _open_miniapp(message: Message, lang: str) -> None:
     """
-    Открываем мини-апп через web_app кнопку.
+    После того, как доступ открыт, мини-апп открывается только
+    через web_app-кнопки в уже существующих экранах.
+    Здесь ничего не отправляем, чтобы не было лишних сообщений.
     """
-    url = settings.miniapp_url or "https://jeempocket.github.io/mini-app/"
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=t_user(lang, "btn_open_app"),
-                    web_app=WebAppInfo(url=url),
-                )
-            ]
-        ]
-    )
-
-    await message.answer(t_user(lang, "signal_coming_soon"), reply_markup=kb)
-
+    return
 
 async def _handle_signal_flow(
     bot: Bot,

@@ -1934,4 +1934,23 @@ async def _handle_signal_flow(
         # ---------------------------------------------------------------------------
 
         async def run_child_bot(bot_token: str, tenant_id: int) -> None:
-            tenant = await _
+            tenant = await _get_tenant(tenant_id)
+            if tenant is None:
+                logger.error("Tenant %s not found, child bot will not start", tenant_id)
+                return
+
+            bot = Bot(
+                token=bot_token,
+                default=DefaultBotProperties(parse_mode="HTML"),
+            )
+            dp = Dispatcher()
+            dp.include_router(make_child_router(tenant_id))
+
+            logger.info("Starting child bot for tenant %s", tenant_id)
+            try:
+                await dp.start_polling(bot)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Child bot for tenant %s crashed: %s", tenant_id, e)
+            finally:
+                await bot.session.close()
+                logger.info("Child bot for tenant %s stopped", tenant_id)

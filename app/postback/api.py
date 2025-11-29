@@ -6,7 +6,7 @@ from fastapi import APIRouter, Query
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
-from aiogram.exceptions import TelegramBadRequest, TelegramForbidden
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -23,7 +23,7 @@ router = APIRouter(prefix="/pb", tags=["postback"])
 
 async def _get_tenant_by_code(code: str) -> Optional[Tenant]:
     async with SessionLocal() as session:
-        # сначала пробуем по pb_secret
+        # Сначала пробуем по pb_secret
         res = await session.execute(
             select(Tenant).where(Tenant.pb_secret == code)
         )
@@ -31,7 +31,7 @@ async def _get_tenant_by_code(code: str) -> Optional[Tenant]:
         if tenant:
             return tenant
 
-        # если нет — пробуем tn{id}
+        # Если нет — пробуем tn{id}
         if code.startswith("tn") and code[2:].isdigit():
             tid = int(code[2:])
             tenant = await session.get(Tenant, tid)
@@ -61,43 +61,28 @@ async def _send_screen_with_photo_to_user(
     kb: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
     """
-    Отправка экрана юзеру из postback-сервиса.
-    Любые ошибки Telegram (chat not found / blocked / etc)
-    НЕ должны ломать обработчик постбэка.
+    Универсальная отправка экрана: сначала пробуем картинку assets/.../screen.jpg,
+    если не получилось — просто текст.
+    Любые Telegram-ошибки при отправке заглатываем, чтобы постбэк не падал 500.
     """
-    # как и в детском боте, пока используем assets/en
     path = os.path.join("assets", "en", f"{screen}.jpg")
 
+    if os.path.exists(path):
+        try:
+            photo = FSInputFile(path)
+            await bot.send_photo(chat_id, photo, caption=text, reply_markup=kb)
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to send photo %s: %s", path, e)
+
     try:
-        if os.path.exists(path):
-            try:
-                photo = FSInputFile(path)
-                await bot.send_photo(chat_id, photo, caption=text, reply_markup=kb)
-                return
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "Failed to send photo %s to chat %s: %s",
-                    path,
-                    chat_id,
-                    e,
-                )
-
-        # если фотка не отправилась или её нет — шлём просто текст
         await bot.send_message(chat_id, text, reply_markup=kb)
-
-    except (TelegramBadRequest, TelegramForbidden) as e:
-        # сюда попадает, например, "Bad Request: chat not found"
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        # Например: "Bad Request: chat not found", "Forbidden: bot was blocked by the user"
         logger.warning(
-            "Cannot deliver screen %s to chat %s: %s",
-            screen,
+            "Cannot send message to chat %s (screen=%s): %s",
             chat_id,
-            e,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.exception(
-            "Unexpected error sending screen %s to chat %s: %s",
             screen,
-            chat_id,
             e,
         )
 
@@ -140,7 +125,7 @@ async def _send_access_open_screen_to_user(
     row1 = [
         InlineKeyboardButton(
             text=t_user(lang, "btn_open_app"),
-            callback_data="signal:open_app",
+            callback_data="signal:open_app",  # в боте есть обработчик этого колбэка
         )
     ]
     row2 = []
@@ -167,7 +152,8 @@ async def _get_or_create_user_access_for_click(
     trader_id: Optional[str] = None,
 ) -> Optional[UserAccess]:
     """
-    click_id = tg_id пользователя.
+    click_id = tg_id пользователя (мы его кладём в реф-ссылку).
+    Если click_id не число — просто логируем и не пытаемся отправлять в Telegram.
     """
     try:
         tg_id = int(click_id)
@@ -207,6 +193,10 @@ async def _get_or_create_user_access_for_click(
     return ua
 
 
+# ---------------------------------------------------------------------------
+#  POSTBACK: REG
+# ---------------------------------------------------------------------------
+
 @router.get("/{code}/reg")
 @router.post("/{code}/reg")
 async def postback_reg(
@@ -224,17 +214,18 @@ async def postback_reg(
 
     ua = await _get_or_create_user_access_for_click(tenant, click_id, trader_id)
     if ua is None or ua.user_id is None:
-        return {"status": "ok"}  # сохранить факт всё равно смогли
+        # Некорректный click_id, но запрос от партнёрки мы не роняем
+        return {"status": "ok"}
 
     async with SessionLocal() as session:
-        # обновляем флажок регистрации и trader_id
+        # Обновляем флажок регистрации и trader_id
         res = await session.execute(
             select(UserAccess).where(
                 UserAccess.tenant_id == tenant.id,
                 UserAccess.user_id == ua.user_id,
             )
         )
-        db_ua: UserAccess | None = res.scalar_one_or_none()
+        db_ua: Optional[UserAccess] = res.scalar_one_or_none()
         if db_ua is not None:
             db_ua.is_registered = True
             db_ua.trader_id = trader_id
@@ -255,7 +246,7 @@ async def postback_reg(
             logger.exception("postback_reg DB error: %s", e)
             return {"status": "error", "reason": "db_error"}
 
-    # присылаем шаг депозита
+    # После регистрации отправляем шаг депозита (если бот доступен и чат существует)
     lang = await _get_user_lang(tenant.id, ua.user_id)
     bot = Bot(
         token=tenant.bot_token,
@@ -268,6 +259,10 @@ async def postback_reg(
 
     return {"status": "ok"}
 
+
+# ---------------------------------------------------------------------------
+#  POSTBACK: FTD
+# ---------------------------------------------------------------------------
 
 @router.get("/{code}/ftd")
 @router.post("/{code}/ftd")
@@ -296,7 +291,7 @@ async def postback_ftd(
                 UserAccess.user_id == ua.user_id,
             )
         )
-        db_ua: UserAccess | None = res.scalar_one_or_none()
+        db_ua: Optional[UserAccess] = res.scalar_one_or_none()
         if db_ua is not None:
             db_ua.has_deposit = True
             db_ua.trader_id = trader_id
@@ -318,7 +313,7 @@ async def postback_ftd(
             logger.exception("postback_ftd DB error: %s", e)
             return {"status": "error", "reason": "db_error"}
 
-    # присылаем окно "доступ открыт"
+    # После первого депозита — окно "доступ открыт"
     lang = await _get_user_lang(tenant.id, ua.user_id)
     bot = Bot(
         token=tenant.bot_token,
@@ -331,6 +326,10 @@ async def postback_ftd(
 
     return {"status": "ok"}
 
+
+# ---------------------------------------------------------------------------
+#  POSTBACK: RD
+# ---------------------------------------------------------------------------
 
 @router.get("/{code}/rd")
 @router.post("/{code}/rd")
@@ -359,7 +358,7 @@ async def postback_rd(
                 UserAccess.user_id == ua.user_id,
             )
         )
-        db_ua: UserAccess | None = res.scalar_one_or_none()
+        db_ua: Optional[UserAccess] = res.scalar_one_or_none()
         if db_ua is not None:
             db_ua.trader_id = trader_id
             db_ua.total_deposits = (db_ua.total_deposits or 0) + float(sumdep)
@@ -380,8 +379,7 @@ async def postback_rd(
             logger.exception("postback_rd DB error: %s", e)
             return {"status": "error", "reason": "db_error"}
 
-    # Дополнительно можем ещё раз отправить "доступ открыт" (на случай,
-    # если человек пополнил счёт позже).
+    # Можно ещё раз отправить "доступ открыт" (если человек залил повторно)
     lang = await _get_user_lang(tenant.id, ua.user_id)
     bot = Bot(
         token=tenant.bot_token,

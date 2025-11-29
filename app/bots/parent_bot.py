@@ -18,6 +18,7 @@ from sqlalchemy import select, func, delete
 from app.settings import settings
 from app.db import SessionLocal
 from app.models import Tenant, UserAccess, UserLang, Event
+from aiogram.client.default import DefaultBotProperties
 
 logger = logging.getLogger("pocket_saas.parent")
 
@@ -590,7 +591,10 @@ async def run_parent_bot() -> None:
     """
     Запуск parent-бота.
     """
-    bot = Bot(token=settings.parent_bot_token)
+    bot = Bot(
+        token=settings.parent_bot_token,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
     dp = Dispatcher()
     dp.include_router(router)
 

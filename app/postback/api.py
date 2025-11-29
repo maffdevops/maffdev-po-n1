@@ -5,7 +5,12 @@ from typing import Optional
 from fastapi import APIRouter, Query
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    FSInputFile,
+    WebAppInfo,
+)
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 from sqlalchemy import select
@@ -133,11 +138,13 @@ async def _send_access_open_screen_to_user(
     lang: str,
 ) -> None:
     support_url = tenant.support_url or settings.default_support_url
+    miniapp_url = settings.miniapp_url or "https://jeempocket.github.io/mini-app/"
+
     text = f"{t_user(lang, 'access_title')}\n\n{t_user(lang, 'access_body')}"
     row1 = [
         InlineKeyboardButton(
             text=t_user(lang, "btn_open_app"),
-            callback_data="signal:open_app",
+            web_app=WebAppInfo(url=miniapp_url),
         )
     ]
     row2 = []

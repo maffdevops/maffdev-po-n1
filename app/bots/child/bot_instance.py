@@ -729,18 +729,24 @@ async def _send_deposit_screen(message: Message, tenant: Tenant, lang: str) -> N
     await _send_screen_with_photo(message, lang, "deposit", text, kb)
 
 
-    async def _send_access_open_screen(
-        message: Message,
-        tenant: Tenant,
-        lang: str,
-    ) -> None:
-        support_url = tenant.support_url or settings.default_support_url
-        miniapp_url = settings.miniapp_url or "https://jeempocket.github.io/mini-app/"
+async def _send_access_open_screen(
+    message: Message,
+    tenant: Tenant,
+    lang: str,
+) -> None:
+    """
+    Окно «Доступ открыт»:
+    - кнопка открыть мини-апп (web_app),
+    - кнопка поддержки (если задана),
+    - кнопка «Назад в меню».
+    """
+    support_url = tenant.support_url or settings.default_support_url
+    miniapp_url = settings.miniapp_url or "https://jeempocket.github.io/mini-app/"
 
     text = f"{t_user(lang, 'access_title')}\n\n{t_user(lang, 'access_body')}"
     row1 = [
         InlineKeyboardButton(
-            text=t_user(lang, "btn_open_app"),  # текст типа "Получить сигнал"
+            text=t_user(lang, "btn_open_app"),  # например: «Получить сигнал»
             web_app=WebAppInfo(url=miniapp_url),
         )
     ]
@@ -761,7 +767,6 @@ async def _send_deposit_screen(message: Message, tenant: Tenant, lang: str) -> N
 
     kb = InlineKeyboardMarkup(inline_keyboard=[row1, row2])
     await _send_screen_with_photo(message, lang, "access", text, kb)
-
 
 async def _handle_signal_flow(
     bot: Bot,

@@ -13,11 +13,11 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from sqlalchemy import select
+from sqlalchemy import select, func, delete
 
 from app.settings import settings
 from app.db import SessionLocal
-from app.models import Tenant, UserAccess
+from app.models import Tenant, UserAccess, UserLang, Event
 
 logger = logging.getLogger("pocket_saas.parent")
 
@@ -136,6 +136,212 @@ async def _list_all_active_tenant_user_ids() -> List[int]:
         return [row[0] for row in res_u.all()]
 
 
+def _ga_main_menu_kb() -> InlineKeyboardMarkup:
+    """
+    Главное меню для /stas (ГА).
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📢 Глобальная рассылка",
+                    callback_data="adm:broadcast",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👥 Клиенты",
+                    callback_data="adm:clients",
+                )
+            ],
+        ]
+    )
+
+
+async def _ga_show_clients(call: CallbackQuery) -> None:
+    """
+    Список всех клиентов (тенантов).
+    """
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(Tenant).order_by(Tenant.id.asc())
+        )
+        tenants = list(res.scalars().all())
+
+    if not tenants:
+        text = "👥 Клиентов пока нет."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ В главное меню",
+                        callback_data="adm:back",
+                    )
+                ]
+            ]
+        )
+        await call.message.edit_text(text, reply_markup=kb)
+        await call.answer()
+        return
+
+    lines = ["👥 Список клиентов:\n"]
+    kb_rows: list[list[InlineKeyboardButton]] = []
+
+    for t in tenants:
+        name = t.bot_username or "без username"
+        owner = t.owner_telegram_id or "—"
+        lines.append(f"<b>{t.id}</b> — @{name} (owner: <code>{owner}</code>)")
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{t.id} — @{name}",
+                    callback_data=f"adm:client:{t.id}",
+                )
+            ]
+        )
+
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В главное меню",
+                callback_data="adm:back",
+            )
+        ]
+    )
+
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+async def _ga_show_client_card(call: CallbackQuery, tenant_id: int) -> None:
+    """
+    Карточка конкретного клиента (тенанта).
+    """
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(Tenant).where(Tenant.id == tenant_id)
+        )
+        tenant: Tenant | None = res.scalar_one_or_none()
+        if tenant is None:
+            await call.answer("Клиент не найден", show_alert=True)
+            return
+
+        total_users = await session.scalar(
+            select(func.count()).select_from(UserAccess).where(
+                UserAccess.tenant_id == tenant_id
+            )
+        ) or 0
+
+        regs = await session.scalar(
+            select(func.count()).select_from(UserAccess).where(
+                UserAccess.tenant_id == tenant_id,
+                UserAccess.is_registered.is_(True),
+            )
+        ) or 0
+
+        deps = await session.scalar(
+            select(func.count()).select_from(UserAccess).where(
+                UserAccess.tenant_id == tenant_id,
+                UserAccess.has_deposit.is_(True),
+            )
+        ) or 0
+
+        q_dep = select(
+            func.coalesce(func.sum(Event.amount), 0.0),
+            func.count(),
+        ).where(
+            Event.tenant_id == tenant_id,
+            Event.kind.in_(["ftd", "rd"]),
+        )
+        total_amount, dep_events = (await session.execute(q_dep)).one()
+
+    link = f"https://t.me/{tenant.bot_username}" if tenant.bot_username else "—"
+
+    text = (
+        "👤 Клиент (тенант)\n\n"
+        f"ID: <code>{tenant.id}</code>\n"
+        f"Owner TG ID: <code>{tenant.owner_telegram_id or '—'}</code>\n"
+        f"Bot username: @{tenant.bot_username or '—'}\n"
+        f"Ссылка на бота: {link}\n"
+        f"Активен: <b>{'да' if tenant.is_active else 'нет'}</b>\n\n"
+        f"Проверять подписку: <b>{'да' if tenant.check_subscription else 'нет'}</b>\n"
+        f"Проверять депозит: <b>{'да' if tenant.check_deposit else 'нет'}</b>\n\n"
+        f"Реф. ссылка: {tenant.ref_link or '—'}\n"
+        f"Ссылка на депозит: {tenant.deposit_link or '—'}\n"
+        f"ID канала: <code>{tenant.gate_channel_id or '—'}</code>\n"
+        f"URL канала: {tenant.gate_channel_url or '—'}\n"
+        f"URL поддержки: {tenant.support_url or settings.default_support_url or '—'}\n\n"
+        f"Пользователей в боте: <b>{total_users}</b>\n"
+        f"Из них с регистрацией: <b>{regs}</b>\n"
+        f"Из них с депозитом: <b>{deps}</b>\n\n"
+        f"Всего депозитов (FTD+RD), сумма: <b>{total_amount}</b>\n"
+        f"Количество депозитных событий: <b>{dep_events}</b>\n"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить клиента полностью",
+                    callback_data=f"adm:client:del:{tenant_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К списку клиентов",
+                    callback_data="adm:clients",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В главное меню",
+                    callback_data="adm:back",
+                )
+            ],
+        ]
+    )
+
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+async def _ga_delete_tenant_full(tenant_id: int) -> bool:
+    """
+    Полное удаление клиента:
+    - все UserAccess
+    - все UserLang
+    - все Event
+    - сам Tenant
+
+    После этого его дочерний бот по сути "отключен".
+    """
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(Tenant).where(Tenant.id == tenant_id)
+        )
+        tenant: Tenant | None = res.scalar_one_or_none()
+        if tenant is None:
+            return False
+
+        await session.execute(
+            delete(UserAccess).where(UserAccess.tenant_id == tenant_id)
+        )
+        await session.execute(
+            delete(UserLang).where(UserLang.tenant_id == tenant_id)
+        )
+        await session.execute(
+            delete(Event).where(Event.tenant_id == tenant_id)
+        )
+
+        await session.delete(tenant)
+        await session.commit()
+
+    logger.info("GA deleted tenant %s with all related data", tenant_id)
+    return True
+
+
 # --- handlers: подключение тенанта ----------------------------------------
 
 
@@ -217,44 +423,104 @@ async def _handle_new_bot_token(message: Message, token: str) -> None:
 async def cmd_stas(message: Message) -> None:
     """
     Главная админка (только для GA).
-    Через неё запускаем рассылку по всем пользователям всех тенантов.
+    Через неё:
+    - глобальная рассылка по всем пользователям
+    - управление клиентами (тенантами)
     """
     if not _is_ga(message.from_user.id):
         await message.answer("❌ Эта команда только для владельца.")
         return
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📢 Сделать рассылку по всем пользователям",
-                    callback_data="adm:broadcast",
-                )
-            ],
-        ]
-    )
-
     await message.answer(
-        "👑 Главное меню админа.\n\n"
-        "Пока здесь только один пункт — глобальная рассылка по всем пользователям "
-        "всех активных тенантов.",
-        reply_markup=kb,
+        "👑 Главное меню админа.",
+        reply_markup=_ga_main_menu_kb(),
     )
 
 
-@router.callback_query(F.data == "adm:broadcast")
-async def cb_adm_broadcast(call: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("adm:"))
+async def cb_adm(call: CallbackQuery) -> None:
+    """
+    Все клики по меню /stas.
+    """
     user_id = call.from_user.id
     if not _is_ga(user_id):
         await call.answer("Нет доступа", show_alert=True)
         return
 
-    waiting_broadcast.add(user_id)
-    await call.message.answer(
-        "✏️ Отправь текст рассылки одним сообщением.\n\n"
-        "Как только получу текст — начну отправку по всем пользователям."
-    )
-    await call.answer()  # закрываем кружочек
+    data = call.data
+    parts = data.split(":")
+
+    if len(parts) < 2:
+        await call.answer("Некорректная команда", show_alert=True)
+        return
+
+    cmd = parts[1]
+
+    # back -> в главное меню
+    if cmd == "back":
+        await call.message.edit_text(
+            "👑 Главное меню админа.",
+            reply_markup=_ga_main_menu_kb(),
+        )
+        await call.answer()
+        return
+
+    # глобальная рассылка (как было раньше)
+    if cmd == "broadcast":
+        waiting_broadcast.add(user_id)
+        await call.message.answer(
+            "✏️ Отправь текст рассылки одним сообщением.\n\n"
+            "Как только получу текст — начну отправку по всем пользователям "
+            "всех активных тенантов."
+        )
+        await call.answer()
+        return
+
+    # список клиентов
+    if cmd == "clients":
+        await _ga_show_clients(call)
+        return
+
+    # работа с конкретным клиентом
+    if cmd == "client":
+        # варианты:
+        # adm:client:<id>
+        # adm:client:del:<id>
+        if len(parts) < 3:
+            await call.answer("Некорректная команда", show_alert=True)
+            return
+
+        sub = parts[2]
+
+        # показ карточки
+        if sub.isdigit():
+            tenant_id = int(sub)
+            await _ga_show_client_card(call, tenant_id)
+            return
+
+        # удаление
+        if sub == "del":
+            if len(parts) < 4:
+                await call.answer("Некорректная команда", show_alert=True)
+                return
+            try:
+                tenant_id = int(parts[3])
+            except ValueError:
+                await call.answer("Некорректный ID клиента", show_alert=True)
+                return
+
+            ok = await _ga_delete_tenant_full(tenant_id)
+            if not ok:
+                await call.answer("Клиент не найден", show_alert=True)
+                return
+
+            await call.message.edit_text(
+                "🗑 Клиент и все связанные с ним данные полностью удалены."
+            )
+            await call.answer("Удалено", show_alert=True)
+            return
+
+    await call.answer("Неизвестная команда", show_alert=True)
 
 
 # --- fallback: текстовые сообщения ----------------------------------------

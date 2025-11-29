@@ -1,23 +1,21 @@
 import logging
 
-import uvicorn
 from fastapi import FastAPI
+import uvicorn
 
 from app.postback.api import router as postback_router
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logger = logging.getLogger("pocket_saas.postback_main")
 
-app = FastAPI(title="Pocket SaaS Postback")
+app = FastAPI()
 app.include_router(postback_router)
 
 
 if __name__ == "__main__":
+    # Запускаем uvicorn на 0.0.0.0:8000 без reload (под systemd он не нужен)
     uvicorn.run(
-        "run_postback:app",
+        app,
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        log_level="info",
     )

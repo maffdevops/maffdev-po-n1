@@ -519,6 +519,7 @@ async def _send_screen_with_photo(
     text: str,
     kb: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
+    # Пока используем en-картинки, тексты — в нужном языке
     path = os.path.join("assets", "en", f"{screen}.jpg")
 
     if os.path.exists(path):
@@ -763,13 +764,13 @@ async def _send_access_open_screen(
     await _send_screen_with_photo(message, lang, "access", text, kb)
 
 
-async def _open_miniapp(message: Message, lang: str) -> None:
+async def _open_miniapp(message: Message, tenant: Tenant, lang: str) -> None:
     """
-    Исторический хэндлер для callback'а signal:open_app.
-    Сейчас мини-апп открывается только web_app-кнопками,
-    поэтому тут ничего не отправляем, чтобы не спамить текстом.
+    Хэндлер для callback'а signal:open_app:
+    всегда показываем окно «Доступ открыт» с web_app кнопкой.
+    Это нужно, чтобы кнопка из постбэка тоже открывала мини-апп.
     """
-    return
+    await _send_access_open_screen(message, tenant, lang)
 
 
 async def _handle_signal_flow(
@@ -974,6 +975,8 @@ async def _admin_delete_user_record(tenant_id: int, user_id: int) -> None:
             )
         )
         await session.commit()
+    # сбрасываем флаг "доступ открыт" для этого юзера
+    access_welcome_shown.discard((tenant_id, user_id))
 
 
 async def _admin_search_and_show_user(
@@ -1587,15 +1590,23 @@ def make_child_router(tenant_id: int) -> Router:
 
     @router.callback_query(F.data == "signal:open_app")
     async def cb_signal_open_app(call: CallbackQuery) -> None:
-        # исторический callback, оставлен для совместимости;
-        # сейчас ничего не делает, чтобы не спамить лишними сообщениями.
+        """
+        Исторический callback + кнопка из постбэка.
+        Сейчас по нему показываем окно «Доступ открыт»
+        с web_app-кнопкой.
+        """
         user = call.from_user
         if user is None:
             await call.answer()
             return
 
+        tenant = await _get_tenant(tenant_id)
+        if tenant is None:
+            await call.answer("Тенант не найден", show_alert=True)
+            return
+
         lang = await _get_user_lang(tenant_id, user.id) or settings.lang_default
-        await _open_miniapp(call.message, lang)
+        await _open_miniapp(call.message, tenant, lang)
         await call.answer()
 
     # ---------- админка ----------
@@ -1690,9 +1701,9 @@ def make_child_router(tenant_id: int) -> Router:
                 await _admin_show_user_card(call, tenant_id, uid)
                 return
             if action == "del":
+                # удаляем пользователя и сразу показываем обновлённый список
                 await _admin_delete_user_record(tenant_id, uid)
-                await call.message.edit_text("Пользователь удалён.")
-                await call.answer()
+                await _admin_show_users(call, tenant_id, page=1)
                 return
 
         # ---- постбэки (экран с URL) ----

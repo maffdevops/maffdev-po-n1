@@ -729,21 +729,31 @@ async def _send_deposit_screen(message: Message, tenant: Tenant, lang: str) -> N
     await _send_screen_with_photo(message, lang, "deposit", text, kb)
 
 
-async def _send_access_open_screen(
+aasync def _send_access_open_screen(
     message: Message,
     tenant: Tenant,
     lang: str,
 ) -> None:
+    """
+    Окно «Доступ открыт».
+
+    Здесь КНОПКА ДОЛЖНА ОТКРЫВАТЬ МИНИ-АПП через web_app, а не через callback.
+    Текст оставляем как «Получить сигнал» (btn_signal), чтобы всё
+    выглядело одинаково и в меню, и в этом окне.
+    """
     support_url = tenant.support_url or settings.default_support_url
     miniapp_url = settings.miniapp_url or "https://jeempocket.github.io/mini-app/"
 
     text = f"{t_user(lang, 'access_title')}\n\n{t_user(lang, 'access_body')}"
+
+    # основная кнопка — сразу web_app
     row1 = [
         InlineKeyboardButton(
-            text=t_user(lang, "btn_open_app"),  # текст типа "Получить сигнал"
+            text=t_user(lang, "btn_signal"),  # «Получить сигнал»
             web_app=WebAppInfo(url=miniapp_url),
         )
     ]
+
     row2: list[InlineKeyboardButton] = []
     if support_url:
         row2.append(

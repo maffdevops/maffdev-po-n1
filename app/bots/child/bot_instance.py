@@ -780,7 +780,7 @@ async def _handle_signal_flow(
     1) Подписка (если включена),
     2) Регистрация (обязательно всегда),
     3) Депозит (если включён),
-    4) Окно «Доступ открыт» один раз.
+    4) Окно «Доступ открыт» + обновление главного меню.
 
     Флаги регистрации и депозита берём ИЗ СОБЫТИЙ Event
     (reg / ftd / rd) + синхронизация в UserAccess.
@@ -815,13 +815,14 @@ async def _handle_signal_flow(
         await _send_deposit_screen(message, tenant, lang)
         return
 
-    # 4) Всё ок — показываем "Доступ открыт" один раз
+    # 4) Всё ок — показываем "Доступ открыт" (первый раз) и ОБНОВЛЯЕМ главное меню
     key = (tenant_id, user_id)
     if key not in access_welcome_shown:
         access_welcome_shown.add(key)
         await _send_access_open_screen(message, tenant, lang)
-    # Если уже показывали — ничего не шлём,
-    # в главном меню кнопка "Получить сигнал" уже открывает мини-апп.
+
+    # Всегда шлём свежее главное меню с корректной web_app-кнопкой
+    await _send_main_menu(message, tenant_id, lang)
 
 
 # ---------------------------------------------------------------------------
@@ -1587,7 +1588,7 @@ def make_child_router(tenant_id: int) -> Router:
     @router.callback_query(F.data == "signal:open_app")
     async def cb_signal_open_app(call: CallbackQuery) -> None:
         # исторический callback, но теперь используем его чтобы выслать
-        # свежее окно "Доступ открыт" с web_app-кнопкой
+        # свежее окно "Доступ открыт" с web_app-кнопкой и обновить меню
         user = call.from_user
         if user is None:
             await call.answer()
@@ -1602,6 +1603,10 @@ def make_child_router(tenant_id: int) -> Router:
 
         # шлём НОВОЕ окно "Доступ открыт" с web_app
         await _send_access_open_screen(call.message, tenant, lang)
+        # и сразу обновляем главное меню, чтобы кнопка "Получить сигнал"
+        # стала web_app и отразила актуальный язык/доступ
+        await _send_main_menu(call.message, tenant_id, lang)
+
         await call.answer()
 
     # ---------- админка ----------

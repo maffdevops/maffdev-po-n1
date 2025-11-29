@@ -384,6 +384,7 @@ link_waiting: Dict[int, Tuple[int, str]] = {}  # admin -> (tenant_id, field)
 # для «окно доступ открыт только один раз»
 access_welcome_shown: set[tuple[int, int]] = set()
 
+
 # ---------------------------------------------------------------------------
 # пользовательское меню + онбординг
 # ---------------------------------------------------------------------------
@@ -691,9 +692,8 @@ async def _send_access_open_screen(
 
 async def _open_miniapp(message: Message, lang: str) -> None:
     """
-    Раньше тут отправлялось сообщение "Скоро здесь будет логика...".
-    Сейчас мини-апп открывается только web_app-кнопками,
-    поэтому здесь ничего не отправляем.
+    Исторический метод. Сейчас мини-апп открывается только web_app-кнопками,
+    поэтому здесь ничего не отправляем, чтобы не спамить лишними сообщениями.
     """
     return
 
@@ -748,596 +748,617 @@ async def _handle_signal_flow(
     # Если уже показывали — ничего не шлём,
     # в главном меню кнопка "Получить сигнал" уже открывает мини-апп.
 
-    # ---------------------------------------------------------------------------
-    # пользователи (админка)
-    # ---------------------------------------------------------------------------
 
-    def _build_user_card_text(ua: UserAccess, user_lang: Optional[str]) -> str:
-        lang_label = user_lang or "—"
-        reg_label = "да" if ua.is_registered else "нет"
-        dep_label = "да" if ua.has_deposit else "нет"
+# ---------------------------------------------------------------------------
+# пользователи (админка)
+# ---------------------------------------------------------------------------
 
-        return (
-            "👤 Пользователь\n\n"
-            f"TG ID: <code>{ua.user_id}</code>\n"
-            f"Username: @{ua.username or '—'}\n"
-            f"Язык: <b>{lang_label}</b>\n"
-            f"Зарегистрирован: <b>{reg_label}</b>\n"
-            f"С депозитом: <b>{dep_label}</b>\n"
-            f"Trader ID: <code>{ua.trader_id or '—'}</code>\n"
-            f"Всего депозитов (счётчик): <b>{ua.total_deposits}</b>\n"
-            f"click_id: <code>{ua.click_id or '—'}</code>\n"
+def _build_user_card_text(ua: UserAccess, user_lang: Optional[str]) -> str:
+    lang_label = user_lang or "—"
+    reg_label = "да" if ua.is_registered else "нет"
+    dep_label = "да" if ua.has_deposit else "нет"
+
+    return (
+        "👤 Пользователь\n\n"
+        f"TG ID: <code>{ua.user_id}</code>\n"
+        f"Username: @{ua.username or '—'}\n"
+        f"Язык: <b>{lang_label}</b>\n"
+        f"Зарегистрирован: <b>{reg_label}</b>\n"
+        f"С депозитом: <b>{dep_label}</b>\n"
+        f"Trader ID: <code>{ua.trader_id or '—'}</code>\n"
+        f"Всего депозитов (счётчик): <b>{ua.total_deposits}</b>\n"
+        f"click_id: <code>{ua.click_id or '—'}</code>\n"
+    )
+
+
+def _build_user_card_kb(ua: UserAccess) -> InlineKeyboardMarkup:
+    reg_text = "✅ Снять регистрацию" if ua.is_registered else "✅ Выдать регистрацию"
+    dep_text = "💰 Снять депозит" if ua.has_deposit else "💰 Выдать депозит"
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=reg_text,
+                callback_data=f"adm:user:reg:{ua.user_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=dep_text,
+                callback_data=f"adm:user:dep:{ua.user_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🗑 Удалить пользователя",
+                callback_data=f"adm:user:del:{ua.user_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ К списку",
+                callback_data="adm:users",
+            )
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _fetch_user_and_lang(
+    tenant_id: int,
+    user_id: int,
+) -> tuple[Optional[UserAccess], Optional[str]]:
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(UserAccess).where(
+                UserAccess.tenant_id == tenant_id,
+                UserAccess.user_id == user_id,
+            )
         )
+        ua: UserAccess | None = res.scalar_one_or_none()
+        if ua is None:
+            return None, None
 
-    def _build_user_card_kb(ua: UserAccess) -> InlineKeyboardMarkup:
-        reg_text = "✅ Снять регистрацию" if ua.is_registered else "✅ Выдать регистрацию"
-        dep_text = "💰 Снять депозит" if ua.has_deposit else "💰 Выдать депозит"
+        res_l = await session.execute(
+            select(UserLang).where(
+                UserLang.tenant_id == tenant_id,
+                UserLang.user_id == user_id,
+            )
+        )
+        ul: UserLang | None = res_l.scalar_one_or_none()
+        user_lang = ul.lang if ul else None
 
-        rows = [
-            [
-                InlineKeyboardButton(
-                    text=reg_text,
-                    callback_data=f"adm:user:reg:{ua.user_id}",
+    return ua, user_lang
+
+
+async def _admin_show_user_card(
+    call: CallbackQuery,
+    tenant_id: int,
+    user_id: int,
+) -> None:
+    ua, user_lang = await _fetch_user_and_lang(tenant_id, user_id)
+    if ua is None:
+        await call.answer("Пользователь не найден", show_alert=True)
+        return
+
+    text = _build_user_card_text(ua, user_lang)
+    kb = _build_user_card_kb(ua)
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+async def _admin_toggle_user_flag(
+    tenant_id: int,
+    user_id: int,
+    flag: str,
+) -> bool:
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(UserAccess).where(
+                UserAccess.tenant_id == tenant_id,
+                UserAccess.user_id == user_id,
+            )
+        )
+        ua: UserAccess | None = res.scalar_one_or_none()
+        if ua is None:
+            return False
+
+        if flag == "reg":
+            ua.is_registered = not ua.is_registered
+        elif flag == "dep":
+            ua.has_deposit = not ua.has_deposit
+        else:
+            return False
+
+        await session.commit()
+        return True
+
+
+async def _admin_delete_user_record(tenant_id: int, user_id: int) -> None:
+    async with SessionLocal() as session:
+        await session.execute(
+            delete(UserAccess).where(
+                UserAccess.tenant_id == tenant_id,
+                UserAccess.user_id == user_id,
+            )
+        )
+        await session.execute(
+            delete(UserLang).where(
+                UserLang.tenant_id == tenant_id,
+                UserLang.user_id == user_id,
+            )
+        )
+        await session.execute(
+            delete(Event).where(
+                Event.tenant_id == tenant_id,
+                Event.user_id == user_id,
+            )
+        )
+        await session.commit()
+
+
+async def _admin_search_and_show_user(
+    message: Message,
+    tenant_id: int,
+    query: str,
+) -> None:
+    ua: Optional[UserAccess] = None
+
+    async with SessionLocal() as session:
+        if query.isdigit():
+            uid = int(query)
+            res = await session.execute(
+                select(UserAccess).where(
+                    UserAccess.tenant_id == tenant_id,
+                    UserAccess.user_id == uid,
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=dep_text,
-                    callback_data=f"adm:user:dep:{ua.user_id}",
+            )
+            ua = res.scalar_one_or_none()
+
+        if ua is None:
+            res = await session.execute(
+                select(UserAccess).where(
+                    UserAccess.tenant_id == tenant_id,
+                    UserAccess.trader_id == query,
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗑 Удалить пользователя",
-                    callback_data=f"adm:user:del:{ua.user_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ К списку",
-                    callback_data="adm:users",
-                )
-            ],
+            )
+            ua = res.scalar_one_or_none()
+
+    if ua is None:
+        await message.answer("Пользователь не найден.")
+        return
+
+    user_lang = await _get_user_lang(tenant_id, ua.user_id)
+    text = _build_user_card_text(ua, user_lang)
+    kb = _build_user_card_kb(ua)
+    await message.answer(text, reply_markup=kb)
+
+
+async def _admin_show_users(
+    call: CallbackQuery,
+    tenant_id: int,
+    page: int = 1,
+) -> None:
+    page_size = 5
+    if page < 1:
+        page = 1
+
+    async with SessionLocal() as session:
+        total = await session.scalar(
+            select(func.count()).select_from(
+                UserAccess
+            ).where(UserAccess.tenant_id == tenant_id)
+        ) or 0
+
+        offset = (page - 1) * page_size
+        res = await session.execute(
+            select(UserAccess)
+            .where(UserAccess.tenant_id == tenant_id)
+            .order_by(UserAccess.user_id.asc())
+            .offset(offset)
+            .limit(page_size)
+        )
+        users = list(res.scalars().all())
+
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    lines = ["🔎 Поиск по пользователям"]
+    if not users:
+        lines.append("")
+        lines.append("Пользователей пока нет.")
+    text = "\n".join(lines)
+
+    kb_rows: List[List[InlineKeyboardButton]] = []
+
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔍 Найти юзера",
+                callback_data="adm:users:search",
+            )
         ]
-        return InlineKeyboardMarkup(inline_keyboard=rows)
+    )
 
-    async def _fetch_user_and_lang(
-            tenant_id: int,
-            user_id: int,
-    ) -> tuple[Optional[UserAccess], Optional[str]]:
-        async with SessionLocal() as session:
-            res = await session.execute(
-                select(UserAccess).where(
-                    UserAccess.tenant_id == tenant_id,
-                    UserAccess.user_id == user_id,
-                )
-            )
-            ua: UserAccess | None = res.scalar_one_or_none()
-            if ua is None:
-                return None, None
-
-            res_l = await session.execute(
-                select(UserLang).where(
-                    UserLang.tenant_id == tenant_id,
-                    UserLang.user_id == user_id,
-                )
-            )
-            ul: UserLang | None = res_l.scalar_one_or_none()
-            user_lang = ul.lang if ul else None
-
-        return ua, user_lang
-
-    async def _admin_show_user_card(
-            call: CallbackQuery,
-            tenant_id: int,
-            user_id: int,
-    ) -> None:
-        ua, user_lang = await _fetch_user_and_lang(tenant_id, user_id)
-        if ua is None:
-            await call.answer("Пользователь не найден", show_alert=True)
-            return
-
-        text = _build_user_card_text(ua, user_lang)
-        kb = _build_user_card_kb(ua)
-        await call.message.edit_text(text, reply_markup=kb)
-        await call.answer()
-
-    async def _admin_toggle_user_flag(
-            tenant_id: int,
-            user_id: int,
-            flag: str,
-    ) -> bool:
-        async with SessionLocal() as session:
-            res = await session.execute(
-                select(UserAccess).where(
-                    UserAccess.tenant_id == tenant_id,
-                    UserAccess.user_id == user_id,
-                )
-            )
-            ua: UserAccess | None = res.scalar_one_or_none()
-            if ua is None:
-                return False
-
-            if flag == "reg":
-                ua.is_registered = not ua.is_registered
-            elif flag == "dep":
-                ua.has_deposit = not ua.has_deposit
-            else:
-                return False
-
-            await session.commit()
-            return True
-
-    async def _admin_delete_user_record(tenant_id: int, user_id: int) -> None:
-        async with SessionLocal() as session:
-            await session.execute(
-                delete(UserAccess).where(
-                    UserAccess.tenant_id == tenant_id,
-                    UserAccess.user_id == user_id,
-                )
-            )
-            await session.execute(
-                delete(UserLang).where(
-                    UserLang.tenant_id == tenant_id,
-                    UserLang.user_id == user_id,
-                )
-            )
-            await session.execute(
-                delete(Event).where(
-                    Event.tenant_id == tenant_id,
-                    Event.user_id == user_id,
-                )
-            )
-            await session.commit()
-
-    async def _admin_search_and_show_user(
-            message: Message,
-            tenant_id: int,
-            query: str,
-    ) -> None:
-        ua: Optional[UserAccess] = None
-
-        async with SessionLocal() as session:
-            if query.isdigit():
-                uid = int(query)
-                res = await session.execute(
-                    select(UserAccess).where(
-                        UserAccess.tenant_id == tenant_id,
-                        UserAccess.user_id == uid,
-                    )
-                )
-                ua = res.scalar_one_or_none()
-
-            if ua is None:
-                res = await session.execute(
-                    select(UserAccess).where(
-                        UserAccess.tenant_id == tenant_id,
-                        UserAccess.trader_id == query,
-                    )
-                )
-                ua = res.scalar_one_or_none()
-
-        if ua is None:
-            await message.answer("Пользователь не найден.")
-            return
-
-        user_lang = await _get_user_lang(tenant_id, ua.user_id)
-        text = _build_user_card_text(ua, user_lang)
-        kb = _build_user_card_kb(ua)
-        await message.answer(text, reply_markup=kb)
-
-    async def _admin_show_users(
-            call: CallbackQuery,
-            tenant_id: int,
-            page: int = 1,
-    ) -> None:
-        page_size = 5
-        if page < 1:
-            page = 1
-
-        async with SessionLocal() as session:
-            total = await session.scalar(
-                select(func.count()).select_from(
-                    UserAccess
-                ).where(UserAccess.tenant_id == tenant_id)
-            ) or 0
-
-            offset = (page - 1) * page_size
-            res = await session.execute(
-                select(UserAccess)
-                .where(UserAccess.tenant_id == tenant_id)
-                .order_by(UserAccess.user_id.asc())
-                .offset(offset)
-                .limit(page_size)
-            )
-            users = list(res.scalars().all())
-
-        total_pages = max(1, (total + page_size - 1) // page_size)
-
-        lines = ["🔎 Поиск по пользователям"]
-        if not users:
-            lines.append("")
-            lines.append("Пользователей пока нет.")
-        text = "\n".join(lines)
-
-        kb_rows: List[List[InlineKeyboardButton]] = []
-
+    for ua in users:
         kb_rows.append(
             [
                 InlineKeyboardButton(
-                    text="🔍 Найти юзера",
-                    callback_data="adm:users:search",
+                    text=str(ua.user_id),
+                    callback_data=f"adm:user:show:{ua.user_id}",
                 )
             ]
         )
 
-        for ua in users:
-            kb_rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=str(ua.user_id),
-                        callback_data=f"adm:user:show:{ua.user_id}",
-                    )
-                ]
-            )
-
-        if total_pages > 1:
-            pag_row: List[InlineKeyboardButton] = []
-            if page > 1:
-                pag_row.append(
-                    InlineKeyboardButton(
-                        text="⬅️",
-                        callback_data=f"adm:users:page:{page - 1}",
-                    )
-                )
+    if total_pages > 1:
+        pag_row: List[InlineKeyboardButton] = []
+        if page > 1:
             pag_row.append(
                 InlineKeyboardButton(
-                    text=f"{page} стр",
-                    callback_data=f"adm:users:page:{page}",
+                    text="⬅️",
+                    callback_data=f"adm:users:page:{page-1}",
                 )
             )
-            if page < total_pages:
-                pag_row.append(
-                    InlineKeyboardButton(
-                        text="➡️",
-                        callback_data=f"adm:users:page:{page + 1}",
-                    )
+        pag_row.append(
+            InlineKeyboardButton(
+                text=f"{page} стр",
+                callback_data=f"adm:users:page:{page}",
+            )
+        )
+        if page < total_pages:
+            pag_row.append(
+                InlineKeyboardButton(
+                    text="➡️",
+                    callback_data=f"adm:users:page:{page+1}",
                 )
-            kb_rows.append(pag_row)
+            )
+        kb_rows.append(pag_row)
 
-        kb_rows.append(
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В админку",
+                callback_data="adm:back",
+            )
+        ]
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# параметры и ссылки
+# ---------------------------------------------------------------------------
+
+async def _admin_toggle_param(tenant_id: int, field: str) -> bool:
+    async with SessionLocal() as session:
+        res = await session.execute(select(Tenant).where(Tenant.id == tenant_id))
+        tenant: Tenant | None = res.scalar_one_or_none()
+        if tenant is None:
+            return False
+
+        if field == "sub":
+            tenant.check_subscription = not tenant.check_subscription
+        elif field == "dep":
+            tenant.check_deposit = not tenant.check_deposit
+        else:
+            return False
+
+        await session.commit()
+        return True
+
+
+def _build_links_text(tenant: Tenant) -> str:
+    return (
+        f"{t_admin('links_header')}\n\n"
+        f"Реф ссылка: {tenant.ref_link or '—'}\n"
+        f"Ссылка на депозит: {tenant.deposit_link or '—'}\n"
+        f"URL поддержки: {tenant.support_url or settings.default_support_url or '—'}\n"
+        f"ID канала: <code>{tenant.gate_channel_id or '—'}</code>\n"
+        f"URL канала: {tenant.gate_channel_url or '—'}\n\n"
+        "Чтобы очистить поле, отправь «-» (дефис)."
+    )
+
+
+async def _admin_show_links(call: CallbackQuery, tenant_id: int) -> None:
+    tenant = await _get_tenant(tenant_id)
+    if tenant is None:
+        await call.answer("Тенант не найден", show_alert=True)
+        return
+
+    text = _build_links_text(tenant)
+    await call.message.edit_text(text, reply_markup=_admin_links_kb())
+    await call.answer()
+
+
+async def _admin_send_links_message(message: Message, tenant_id: int) -> None:
+    tenant = await _get_tenant(tenant_id)
+    if tenant is None:
+        await message.answer("Тенант не найден.")
+        return
+    text = _build_links_text(tenant)
+    await message.answer(text, reply_markup=_admin_links_kb())
+
+
+async def _admin_update_link_value(tenant_id: int, field: str, value: str) -> bool:
+    async with SessionLocal() as session:
+        res = await session.execute(select(Tenant).where(Tenant.id == tenant_id))
+        tenant: Tenant | None = res.scalar_one_or_none()
+        if tenant is None:
+            return False
+
+        val = value.strip()
+        if val in ("-", "—", ""):
+            val = None
+
+        if field == "ref":
+            tenant.ref_link = val
+        elif field == "dep":
+            tenant.deposit_link = val
+        elif field == "support":
+            tenant.support_url = val
+        elif field == "chanid":
+            tenant.gate_channel_id = val
+        elif field == "chanurl":
+            tenant.gate_channel_url = val
+        else:
+            return False
+
+        await session.commit()
+        return True
+
+
+async def _admin_show_params(call: CallbackQuery, tenant_id: int) -> None:
+    tenant = await _get_tenant(tenant_id)
+    if tenant is None:
+        await call.answer("Тенант не найден", show_alert=True)
+        return
+
+    text = (
+        f"{t_admin('params_header')}\n\n"
+        f"Проверять подписку: <b>{'да' if tenant.check_subscription else 'нет'}</b>\n"
+        f"Проверять депозит: <b>{'да' if tenant.check_deposit else 'нет'}</b>\n"
+    )
+
+    await call.message.edit_text(text, reply_markup=_admin_params_kb())
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# постбэки (экран с URL)
+# ---------------------------------------------------------------------------
+
+async def _admin_show_postbacks(call: CallbackQuery, tenant_id: int) -> None:
+    tenant = await _get_tenant(tenant_id)
+    if tenant is None:
+        await call.answer("Тенант не найден", show_alert=True)
+        return
+
+    base = settings.postback_base.rstrip("/")
+    code = _tenant_pb_code(tenant)
+
+    reg_url = (
+        f"{base}/pb/{code}/reg"
+        f"?click_id={{click_id}}&trader_id={{trader_id}}"
+    )
+    ftd_url = (
+        f"{base}/pb/{code}/ftd"
+        f"?click_id={{click_id}}&trader_id={{trader_id}}&sumdep={{sumdep}}"
+    )
+    rd_url = (
+        f"{base}/pb/{code}/rd"
+        f"?click_id={{click_id}}&trader_id={{trader_id}}&sumdep={{sumdep}}"
+    )
+
+    text = (
+        "📩 Настройка постбэков\n\n"
+        "Регистрация:\n"
+        f"<code>{reg_url}</code>\n\n"
+        "Первый депозит:\n"
+        f"<code>{ftd_url}</code>\n\n"
+        "Повторный депозит:\n"
+        f"<code>{rd_url}</code>\n\n"
+        "Параметры:\n"
+        "- <b>click_id</b> — tg_id пользователя (мы передаём его в реф-ссылке);\n"
+        "- <b>trader_id</b> — ID трейдера в кабинете PocketOption;\n"
+        "- <b>sumdep</b> — сумма депозита.\n\n"
+        "Просто скопируй нужный URL и вставь в настройки постбэков партнёрки."
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="⬅️ В админку",
                     callback_data="adm:back",
                 )
             ]
-        )
+        ]
+    )
 
-        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
 
-        await call.message.edit_text(text, reply_markup=kb)
-        await call.answer()
 
-    # ---------------------------------------------------------------------------
-    # параметры и ссылки
-    # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# рассылки
+# ---------------------------------------------------------------------------
 
-    async def _admin_toggle_param(tenant_id: int, field: str) -> bool:
-        async with SessionLocal() as session:
-            res = await session.execute(select(Tenant).where(Tenant.id == tenant_id))
-            tenant: Tenant | None = res.scalar_one_or_none()
-            if tenant is None:
-                return False
+async def _admin_start_broadcast_menu(
+    call: CallbackQuery,
+    tenant_id: int,
+) -> None:
+    text = t_admin("broadcast_choose")
+    kb = _admin_broadcast_segment_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
 
-            if field == "sub":
-                tenant.check_subscription = not tenant.check_subscription
-            elif field == "dep":
-                tenant.check_deposit = not tenant.check_deposit
-            else:
-                return False
 
-            await session.commit()
-            return True
-
-    def _build_links_text(tenant: Tenant) -> str:
-        return (
-            f"{t_admin('links_header')}\n\n"
-            f"Реф ссылка: {tenant.ref_link or '—'}\n"
-            f"Ссылка на депозит: {tenant.deposit_link or '—'}\n"
-            f"URL поддержки: {tenant.support_url or settings.default_support_url or '—'}\n"
-            f"ID канала: <code>{tenant.gate_channel_id or '—'}</code>\n"
-            f"URL канала: {tenant.gate_channel_url or '—'}\n\n"
-            "Чтобы очистить поле, отправь «-» (дефис)."
-        )
-
-    async def _admin_show_links(call: CallbackQuery, tenant_id: int) -> None:
-        tenant = await _get_tenant(tenant_id)
-        if tenant is None:
-            await call.answer("Тенант не найден", show_alert=True)
-            return
-
-        text = _build_links_text(tenant)
-        await call.message.edit_text(text, reply_markup=_admin_links_kb())
-        await call.answer()
-
-    async def _admin_send_links_message(message: Message, tenant_id: int) -> None:
-        tenant = await _get_tenant(tenant_id)
-        if tenant is None:
-            await message.answer("Тенант не найден.")
-            return
-        text = _build_links_text(tenant)
-        await message.answer(text, reply_markup=_admin_links_kb())
-
-    async def _admin_update_link_value(tenant_id: int, field: str, value: str) -> bool:
-        async with SessionLocal() as session:
-            res = await session.execute(select(Tenant).where(Tenant.id == tenant_id))
-            tenant: Tenant | None = res.scalar_one_or_none()
-            if tenant is None:
-                return False
-
-            val = value.strip()
-            if val in ("-", "—", ""):
-                val = None
-
-            if field == "ref":
-                tenant.ref_link = val
-            elif field == "dep":
-                tenant.deposit_link = val
-            elif field == "support":
-                tenant.support_url = val
-            elif field == "chanid":
-                tenant.gate_channel_id = val
-            elif field == "chanurl":
-                tenant.gate_channel_url = val
-            else:
-                return False
-
-            await session.commit()
-            return True
-
-    async def _admin_show_params(call: CallbackQuery, tenant_id: int) -> None:
-        tenant = await _get_tenant(tenant_id)
-        if tenant is None:
-            await call.answer("Тенант не найден", show_alert=True)
-            return
-
-        text = (
-            f"{t_admin('params_header')}\n\n"
-            f"Проверять подписку: <b>{'да' if tenant.check_subscription else 'нет'}</b>\n"
-            f"Проверять депозит: <b>{'да' if tenant.check_deposit else 'нет'}</b>\n"
-        )
-
-        await call.message.edit_text(text, reply_markup=_admin_params_kb())
-        await call.answer()
-
-    # ---------------------------------------------------------------------------
-    # постбэки (экран с URL)
-    # ---------------------------------------------------------------------------
-
-    async def _admin_show_postbacks(call: CallbackQuery, tenant_id: int) -> None:
-        tenant = await _get_tenant(tenant_id)
-        if tenant is None:
-            await call.answer("Тенант не найден", show_alert=True)
-            return
-
-        base = settings.postback_base.rstrip("/")
-        code = _tenant_pb_code(tenant)
-
-        reg_url = (
-            f"{base}/pb/{code}/reg"
-            f"?click_id={{click_id}}&trader_id={{trader_id}}"
-        )
-        ftd_url = (
-            f"{base}/pb/{code}/ftd"
-            f"?click_id={{click_id}}&trader_id={{trader_id}}&sumdep={{sumdep}}"
-        )
-        rd_url = (
-            f"{base}/pb/{code}/rd"
-            f"?click_id={{click_id}}&trader_id={{trader_id}}&sumdep={{sumdep}}"
-        )
-
-        text = (
-            "📩 Настройка постбэков\n\n"
-            "Регистрация:\n"
-            f"<code>{reg_url}</code>\n\n"
-            "Первый депозит:\n"
-            f"<code>{ftd_url}</code>\n\n"
-            "Повторный депозит:\n"
-            f"<code>{rd_url}</code>\n\n"
-            "Параметры:\n"
-            "- <b>click_id</b> — tg_id пользователя (мы передаём его в реф-ссылке);\n"
-            "- <b>trader_id</b> — ID трейдера в кабинете PocketOption;\n"
-            "- <b>sumdep</b> — сумма депозита.\n\n"
-            "Просто скопируй нужный URL и вставь в настройки постбэков партнёрки."
-        )
-
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⬅️ В админку",
-                        callback_data="adm:back",
-                    )
-                ]
-            ]
-        )
-
-        await call.message.edit_text(text, reply_markup=kb)
-        await call.answer()
-
-    # ---------------------------------------------------------------------------
-    # рассылки
-    # ---------------------------------------------------------------------------
-
-    async def _admin_start_broadcast_menu(
-            call: CallbackQuery,
-            tenant_id: int,
-    ) -> None:
-        text = t_admin("broadcast_choose")
-        kb = _admin_broadcast_segment_kb()
-        await call.message.edit_text(text, reply_markup=kb)
-        await call.answer()
-
-    async def _admin_collect_broadcast_targets(
-            tenant_id: int,
-            segment: str,
-            lang_code: Optional[str],
-    ) -> List[int]:
-        async with SessionLocal() as session:
-            if segment in ("all", "sub"):
-                q = select(UserAccess.user_id).where(
-                    UserAccess.tenant_id == tenant_id
+async def _admin_collect_broadcast_targets(
+    tenant_id: int,
+    segment: str,
+    lang_code: Optional[str],
+) -> List[int]:
+    async with SessionLocal() as session:
+        if segment in ("all", "sub"):
+            q = select(UserAccess.user_id).where(
+                UserAccess.tenant_id == tenant_id
+            )
+        elif segment == "reg":
+            q = select(UserAccess.user_id).where(
+                UserAccess.tenant_id == tenant_id,
+                UserAccess.is_registered.is_(True),
+            )
+        elif segment == "dep":
+            q = select(UserAccess.user_id).where(
+                UserAccess.tenant_id == tenant_id,
+                UserAccess.has_deposit.is_(True),
+            )
+        elif segment == "lang" and lang_code:
+            q = (
+                select(UserAccess.user_id)
+                .join(
+                    UserLang,
+                    (UserLang.tenant_id == UserAccess.tenant_id)
+                    & (UserLang.user_id == UserAccess.user_id),
                 )
-            elif segment == "reg":
-                q = select(UserAccess.user_id).where(
+                .where(
                     UserAccess.tenant_id == tenant_id,
-                    UserAccess.is_registered.is_(True),
+                    UserLang.lang == lang_code,
                 )
-            elif segment == "dep":
-                q = select(UserAccess.user_id).where(
-                    UserAccess.tenant_id == tenant_id,
-                    UserAccess.has_deposit.is_(True),
-                )
-            elif segment == "lang" and lang_code:
-                q = (
-                    select(UserAccess.user_id)
-                    .join(
-                        UserLang,
-                        (UserLang.tenant_id == UserAccess.tenant_id)
-                        & (UserLang.user_id == UserAccess.user_id),
-                    )
-                    .where(
-                        UserAccess.tenant_id == tenant_id,
-                        UserLang.lang == lang_code,
-                    )
-                )
-            else:
-                q = select(UserAccess.user_id).where(
-                    UserAccess.tenant_id == tenant_id
-                )
+            )
+        else:
+            q = select(UserAccess.user_id).where(
+                UserAccess.tenant_id == tenant_id
+            )
 
-            res = await session.execute(q)
-            return [row[0] for row in res.all()]
+        res = await session.execute(q)
+        return [row[0] for row in res.all()]
 
-    async def _admin_do_broadcast(
-            bot: Bot,
-            admin_chat_id: int,
-            tenant_id: int,
-            segment: str,
-            lang_code: Optional[str],
-            text: str,
-            media: Optional[dict],
-    ) -> Tuple[int, int]:
-        user_ids = await _admin_collect_broadcast_targets(tenant_id, segment, lang_code)
 
-        if not user_ids:
-            await bot.send_message(admin_chat_id, t_admin("broadcast_empty"))
-            return 0, 0
+async def _admin_do_broadcast(
+    bot: Bot,
+    admin_chat_id: int,
+    tenant_id: int,
+    segment: str,
+    lang_code: Optional[str],
+    text: str,
+    media: Optional[dict],
+) -> Tuple[int, int]:
+    user_ids = await _admin_collect_broadcast_targets(tenant_id, segment, lang_code)
 
-        sent = 0
-        failed = 0
+    if not user_ids:
+        await bot.send_message(admin_chat_id, t_admin("broadcast_empty"))
+        return 0, 0
 
-        for uid in user_ids:
-            try:
-                if media is None:
-                    await bot.send_message(uid, text)
-                else:
-                    mtype = media.get("type")
-                    file_id = media.get("file_id")
-                    if mtype == "photo":
-                        await bot.send_photo(uid, file_id, caption=text or None)
-                    elif mtype == "video":
-                        await bot.send_video(uid, file_id, caption=text or None)
-                    elif mtype == "document":
-                        await bot.send_document(uid, file_id, caption=text or None)
-                    elif mtype == "animation":
-                        await bot.send_animation(uid, file_id, caption=text or None)
-                    else:
-                        await bot.send_message(uid, text)
-                sent += 1
-            except Exception as e:  # noqa: BLE001
-                failed += 1
-                logger.warning(
-                    "Child broadcast error tenant=%s user=%s: %s",
-                    tenant_id,
-                    uid,
-                    e,
-                )
+    sent = 0
+    failed = 0
 
-        return sent, failed
-
-    async def _admin_ask_time(message: Message, admin_id: int) -> None:
-        state = broadcast_state.get(admin_id)
-        if not state:
-            return
-        await message.answer(
-            t_admin("broadcast_time_question"),
-            reply_markup=_admin_broadcast_time_kb(),
-        )
-
-    async def _scheduled_broadcast(
-            bot: Bot,
-            admin_chat_id: int,
-            tenant_id: int,
-            segment: str,
-            lang_code: Optional[str],
-            text: str,
-            media: Optional[dict],
-            delay_seconds: float,
-    ) -> None:
+    for uid in user_ids:
         try:
-            await asyncio.sleep(delay_seconds)
-            sent, failed = await _admin_do_broadcast(
-                bot, admin_chat_id, tenant_id, segment, lang_code, text, media
-            )
-            await bot.send_message(
-                admin_chat_id,
-                t_admin("broadcast_done", sent=sent, failed=failed),
-            )
+            if media is None:
+                await bot.send_message(uid, text)
+            else:
+                mtype = media.get("type")
+                file_id = media.get("file_id")
+                if mtype == "photo":
+                    await bot.send_photo(uid, file_id, caption=text or None)
+                elif mtype == "video":
+                    await bot.send_video(uid, file_id, caption=text or None)
+                elif mtype == "document":
+                    await bot.send_document(uid, file_id, caption=text or None)
+                elif mtype == "animation":
+                    await bot.send_animation(uid, file_id, caption=text or None)
+                else:
+                    await bot.send_message(uid, text)
+            sent += 1
         except Exception as e:  # noqa: BLE001
-            logger.exception("Scheduled broadcast error: %s", e)
-
-    # ---------------------------------------------------------------------------
-    # статистика
-    # ---------------------------------------------------------------------------
-
-    async def _admin_show_stats(call: CallbackQuery, tenant_id: int) -> None:
-        async with SessionLocal() as session:
-            total_users = await session.scalar(
-                select(func.count()).select_from(
-                    UserAccess
-                ).where(UserAccess.tenant_id == tenant_id)
-            ) or 0
-
-            regs = await session.scalar(
-                select(func.count()).select_from(UserAccess).where(
-                    UserAccess.tenant_id == tenant_id,
-                    UserAccess.is_registered.is_(True),
-                )
-            ) or 0
-
-            deps = await session.scalar(
-                select(func.count()).select_from(UserAccess).where(
-                    UserAccess.tenant_id == tenant_id,
-                    UserAccess.has_deposit.is_(True),
-                )
-            ) or 0
-
-            q = select(
-                func.coalesce(func.sum(Event.amount), 0.0),
-                func.count(),
-            ).where(
-                Event.tenant_id == tenant_id,
-                Event.kind.in_(["ftd", "rd"]),
+            failed += 1
+            logger.warning(
+                "Child broadcast error tenant=%s user=%s: %s",
+                tenant_id,
+                uid,
+                e,
             )
-            total_amount, count = (await session.execute(q)).one()
 
-        subs = total_users  # формально тут те, кто дошёл до бота
+    return sent, failed
 
-        text = (
-                f"{t_admin('stats_header')}\n\n"
-                + t_admin(
+
+async def _admin_ask_time(message: Message, admin_id: int) -> None:
+    state = broadcast_state.get(admin_id)
+    if not state:
+        return
+    await message.answer(
+        t_admin("broadcast_time_question"),
+        reply_markup=_admin_broadcast_time_kb(),
+    )
+
+
+async def _scheduled_broadcast(
+    bot: Bot,
+    admin_chat_id: int,
+    tenant_id: int,
+    segment: str,
+    lang_code: Optional[str],
+    text: str,
+    media: Optional[dict],
+    delay_seconds: float,
+) -> None:
+    try:
+        await asyncio.sleep(delay_seconds)
+        sent, failed = await _admin_do_broadcast(
+            bot, admin_chat_id, tenant_id, segment, lang_code, text, media
+        )
+        await bot.send_message(
+            admin_chat_id,
+            t_admin("broadcast_done", sent=sent, failed=failed),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Scheduled broadcast error: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# статистика
+# ---------------------------------------------------------------------------
+
+async def _admin_show_stats(call: CallbackQuery, tenant_id: int) -> None:
+    async with SessionLocal() as session:
+        total_users = await session.scalar(
+            select(func.count()).select_from(
+                UserAccess
+            ).where(UserAccess.tenant_id == tenant_id)
+        ) or 0
+
+        regs = await session.scalar(
+            select(func.count()).select_from(UserAccess).where(
+                UserAccess.tenant_id == tenant_id,
+                UserAccess.is_registered.is_(True),
+            )
+        ) or 0
+
+        deps = await session.scalar(
+            select(func.count()).select_from(UserAccess).where(
+                UserAccess.tenant_id == tenant_id,
+                UserAccess.has_deposit.is_(True),
+            )
+        ) or 0
+
+        q = select(
+            func.coalesce(func.sum(Event.amount), 0.0),
+            func.count(),
+        ).where(
+            Event.tenant_id == tenant_id,
+            Event.kind.in_(["ftd", "rd"]),
+        )
+        total_amount, count = (await session.execute(q)).one()
+
+    subs = total_users  # формально тут те, кто дошёл до бота
+
+    text = (
+        f"{t_admin('stats_header')}\n\n"
+        + t_admin(
             "stats_body",
             total_users=total_users,
             subs=subs,
@@ -1346,611 +1367,613 @@ async def _handle_signal_flow(
             total_amount=total_amount,
             count=count,
         )
+    )
+    await call.message.edit_text(text, reply_markup=_admin_stats_kb())
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# router
+# ---------------------------------------------------------------------------
+
+def make_child_router(tenant_id: int) -> Router:
+    router = Router(name=f"tenant-{tenant_id}")
+
+    # ---------- стандартные команды ----------
+
+    @router.message(CommandStart())
+    async def cmd_start(message: Message) -> None:
+        user = message.from_user
+        if user is None:
+            return
+
+        await _get_or_create_access(
+            tenant_id=tenant_id,
+            user_id=user.id,
+            username=user.username,
         )
-        await call.message.edit_text(text, reply_markup=_admin_stats_kb())
+
+        lang = await _get_user_lang(tenant_id, user.id)
+
+        if lang is None:
+            await _send_lang_menu(message)
+            return
+
+        await _send_main_menu(message, tenant_id, lang)
+
+    @router.message(Command("lang"))
+    async def cmd_lang(message: Message) -> None:
+        await _send_lang_menu(message)
+
+    # ---------- выбор языка пользователем ----------
+
+    @router.callback_query(F.data.startswith("lang:"))
+    async def cb_lang(call: CallbackQuery) -> None:
+        user = call.from_user
+        if user is None:
+            await call.answer()
+            return
+
+        _, code = call.data.split(":", 1)
+        if code not in LANGS:
+            await call.answer("Unknown language", show_alert=True)
+            return
+
+        await _set_user_lang(tenant_id, user.id, code)
+
+        text = t_user(code, "lang_changed")
+        await call.message.answer(text)
+        await _send_main_menu(call.message, tenant_id, code)
+
         await call.answer()
 
-        # ---------------------------------------------------------------------------
-        # router
-        # ---------------------------------------------------------------------------
-
-        def make_child_router(tenant_id: int) -> Router:
-            router = Router(name=f"tenant-{tenant_id}")
-
-            # ---------- стандартные команды ----------
-
-            @router.message(CommandStart())
-            async def cmd_start(message: Message) -> None:
-                user = message.from_user
-                if user is None:
-                    return
-
-                await _get_or_create_access(
-                    tenant_id=tenant_id,
-                    user_id=user.id,
-                    username=user.username,
-                )
-
-                lang = await _get_user_lang(tenant_id, user.id)
-
-                if lang is None:
-                    await _send_lang_menu(message)
-                    return
-
-                await _send_main_menu(message, tenant_id, lang)
-
-            @router.message(Command("lang"))
-            async def cmd_lang(message: Message) -> None:
-                await _send_lang_menu(message)
-
-            # ---------- выбор языка пользователем ----------
-
-            @router.callback_query(F.data.startswith("lang:"))
-            async def cb_lang(call: CallbackQuery) -> None:
-                user = call.from_user
-                if user is None:
-                    await call.answer()
-                    return
-
-                _, code = call.data.split(":", 1)
-                if code not in LANGS:
-                    await call.answer("Unknown language", show_alert=True)
-                    return
-
-                await _set_user_lang(tenant_id, user.id, code)
-
-                text = t_user(code, "lang_changed")
-                await call.message.answer(text)
-                await _send_main_menu(call.message, tenant_id, code)
-
-                await call.answer()
-
-            @router.callback_query(F.data == "menu:lang")
-            async def cb_menu_lang(call: CallbackQuery) -> None:
-                await _send_lang_menu(call.message)
-                await call.answer()
-
-            @router.callback_query(F.data == "menu:instruction")
-            async def cb_menu_instruction(call: CallbackQuery) -> None:
-                user = call.from_user
-                if user is None:
-                    await call.answer()
-                    return
-                lang = await _get_user_lang(tenant_id, user.id) or settings.lang_default
-                await _send_instruction(call.message, lang)
-                await call.answer()
-
-            @router.callback_query(F.data == "menu:back")
-            async def cb_menu_back(call: CallbackQuery) -> None:
-                user = call.from_user
-                if user is None:
-                    await call.answer()
-                    return
-                lang = await _get_user_lang(tenant_id, user.id) or settings.lang_default
-                await _send_main_menu(call.message, tenant_id, lang)
-                await call.answer()
-
-            # ---------- «Получить сигнал» + signal:... ----------
-
-            @router.callback_query(F.data == "menu:signal")
-            async def cb_menu_signal(call: CallbackQuery) -> None:
-                user = call.from_user
-                if user is None:
-                    await call.answer()
-                    return
-
-                await _handle_signal_flow(
-                    call.message.bot,
-                    call.message,
-                    tenant_id=tenant_id,
-                    user_id=user.id,
-                )
-                await call.answer()
-
-            @router.callback_query(F.data == "signal:sub_ok")
-            async def cb_signal_sub_ok(call: CallbackQuery) -> None:
-                """
-                Нажали «Я подписался» — проверяем подписку и идём дальше по цепочке.
-                """
-                user = call.from_user
-                if user is None:
-                    await call.answer()
-                    return
-
-                tenant = await _get_tenant(tenant_id)
-                if tenant is None:
-                    await call.answer("Тенант не найден", show_alert=True)
-                    return
-
-                is_sub = await _check_subscription(call.message.bot, tenant, user.id)
-                if not is_sub:
-                    await call.answer(
-                        "Я не вижу тебя в канале. Подпишись и попробуй ещё раз.",
-                        show_alert=True,
-                    )
-                    return
-
-                # раз подписка есть — двигаем цепочку дальше
-                await _handle_signal_flow(
-                    call.message.bot,
-                    call.message,
-                    tenant_id=tenant_id,
-                    user_id=user.id,
-                )
-                await call.answer()
-
-            @router.callback_query(F.data == "signal:open_app")
-            async def cb_signal_open_app(call: CallbackQuery) -> None:
-                # исторический callback, оставлен для совместимости;
-                # сейчас ничего не делает, чтобы не спамить лишними сообщениями.
-                user = call.from_user
-                if user is None:
-                    await call.answer()
-                    return
-
-                lang = await _get_user_lang(tenant_id, user.id) or settings.lang_default
-                await _open_miniapp(call.message, lang)
-                await call.answer()
-
-            # ---------- админка ----------
-
-            @router.message(Command("admin"))
-            async def cmd_admin(message: Message) -> None:
-                user = message.from_user
-                if user is None:
-                    return
-
-                if not await _is_tenant_admin(tenant_id, user.id):
-                    await message.answer(t_admin("no_admin"))
-                    return
-
-                await message.answer(
-                    t_admin("menu"),
-                    reply_markup=_admin_menu_kb(),
-                )
-
-            @router.callback_query(F.data.startswith("adm:"))
-            async def cb_admin(call: CallbackQuery) -> None:
-                user = call.from_user
-                if user is None:
-                    await call.answer()
-                    return
-
-                if not await _is_tenant_admin(tenant_id, user.id):
-                    await call.answer("Нет доступа", show_alert=True)
-                    return
-
-                data = call.data
-                parts = data.split(":")
-
-                if len(parts) == 1:
-                    await call.answer("Неизвестная команда", show_alert=True)
-                    return
-
-                cmd = parts[1]
-
-                if cmd == "back":
-                    await call.message.edit_text(
-                        t_admin("menu"),
-                        reply_markup=_admin_menu_kb(),
-                    )
-                    await call.answer()
-                    return
-
-                # ---- пользователи ----
-                if cmd == "users":
-                    if len(parts) == 2:
-                        page = 1
-                        await _admin_show_users(call, tenant_id, page)
-                        return
-
-                    sub = parts[2]
-                    if sub == "page":
-                        try:
-                            page = int(parts[3])
-                        except (IndexError, ValueError):
-                            page = 1
-                        await _admin_show_users(call, tenant_id, page)
-                        return
-                    if sub == "search":
-                        search_user_waiting[user.id] = tenant_id
-                        await call.message.answer(
-                            "Отправь <code>tg_id</code> или <code>trader_id</code> пользователя,"
-                            " и я покажу его карточку."
-                        )
-                        await call.answer()
-                        return
-
-                # ---- отдельный пользователь ----
-                if cmd == "user":
-                    if len(parts) < 4:
-                        await call.answer("Некорректная команда", show_alert=True)
-                        return
-                    action = parts[2]
-                    try:
-                        uid = int(parts[3])
-                    except ValueError:
-                        await call.answer("Некорректный user_id", show_alert=True)
-                        return
-
-                    if action == "show":
-                        await _admin_show_user_card(call, tenant_id, uid)
-                        return
-                    if action in ("reg", "dep"):
-                        ok = await _admin_toggle_user_flag(tenant_id, uid, action)
-                        if not ok:
-                            await call.answer("Пользователь не найден", show_alert=True)
-                            return
-                        await _admin_show_user_card(call, tenant_id, uid)
-                        return
-                    if action == "del":
-                        await _admin_delete_user_record(tenant_id, uid)
-                        await call.message.edit_text("Пользователь удалён.")
-                        await call.answer()
-                        return
-
-                # ---- постбэки (экран с URL) ----
-                if cmd == "events":
-                    await _admin_show_postbacks(call, tenant_id)
-                    return
-
-                # ---- параметры ----
-                if cmd == "params":
-                    if len(parts) == 2:
-                        await _admin_show_params(call, tenant_id)
-                        return
-                    action = parts[2]
-                    if action in ("sub", "dep"):
-                        ok = await _admin_toggle_param(tenant_id, action)
-                        if not ok:
-                            await call.answer("Не удалось изменить параметр", show_alert=True)
-                            return
-                        await _admin_show_params(call, tenant_id)
-                        return
-
-                # ---- ссылки ----
-                if cmd == "links":
-                    if len(parts) == 2:
-                        await _admin_show_links(call, tenant_id)
-                        return
-                    sub = parts[2]
-                    if sub == "set":
-                        if len(parts) < 4:
-                            await call.answer("Некорректная команда", show_alert=True)
-                            return
-                        field = parts[3]
-                        link_waiting[user.id] = (tenant_id, field)
-
-                        if field == "ref":
-                            text = "Отправь новую реф-ссылку (полный URL)."
-                        elif field == "dep":
-                            text = "Отправь ссылку на депозит (URL)."
-                        elif field == "support":
-                            text = "Отправь URL поддержки."
-                        elif field == "chanid":
-                            text = "Отправь ID канала (например, -1001234567890)."
-                        elif field == "chanurl":
-                            text = "Отправь URL канала."
-                        else:
-                            await call.answer("Неизвестное поле", show_alert=True)
-                            return
-
-                        await call.message.answer(
-                            text + "\nЕсли хочешь очистить, отправь «-»."
-                        )
-                        await call.answer()
-                        return
-
-                # ---- рассылки ----
-                if cmd == "bc":
-                    # adm:bc -> выбор сегмента
-                    if len(parts) == 2:
-                        await _admin_start_broadcast_menu(call, tenant_id)
-                        return
-
-                    sub = parts[2]
-
-                    # выбор сегмента
-                    if sub == "seg":
-                        if len(parts) < 4:
-                            await call.answer("Некорректная команда", show_alert=True)
-                            return
-                        seg = parts[3]
-                        if seg == "lang":
-                            # дальше выбираем язык
-                            broadcast_state[user.id] = {
-                                "tenant_id": tenant_id,
-                                "segment": "lang",
-                                "lang_code": None,
-                                "stage": "await_lang",
-                                "text": None,
-                                "media": None,
-                            }
-                            await call.message.edit_text(
-                                "Выбери язык для рассылки:",
-                                reply_markup=_admin_broadcast_lang_kb(),
-                            )
-                            await call.answer()
-                            return
-
-                        if seg in ("all", "reg", "dep"):
-                            broadcast_state[user.id] = {
-                                "tenant_id": tenant_id,
-                                "segment": seg,
-                                "lang_code": None,
-                                "stage": "await_text",
-                                "text": None,
-                                "media": None,
-                            }
-                            await call.message.answer(t_admin("broadcast_prompt"))
-                            await call.answer()
-                            return
-
-                    # выбор языка для сегмента lang
-                    if sub == "lang":
-                        if len(parts) < 4:
-                            await call.answer("Некорректная команда", show_alert=True)
-                            return
-                        code = parts[3]
-                        if code not in LANGS:
-                            await call.answer("Неизвестный язык", show_alert=True)
-                            return
-                        broadcast_state[user.id] = {
-                            "tenant_id": tenant_id,
-                            "segment": "lang",
-                            "lang_code": code,
-                            "stage": "await_text",
-                            "text": None,
-                            "media": None,
-                        }
-                        await call.message.answer(
-                            t_admin("broadcast_prompt")
-                            + f"\n\nВыбран язык: {NATIVE_LANG_NAMES.get(code, code)}"
-                        )
-                        await call.answer()
-                        return
-
-                    # вопрос про медиа
-                    if sub == "media":
-                        if len(parts) < 4:
-                            await call.answer("Некорректная команда", show_alert=True)
-                            return
-                        choice = parts[3]
-                        state = broadcast_state.get(user.id)
-                        if not state or state.get("tenant_id") != tenant_id:
-                            await call.answer("Нет активной рассылки", show_alert=True)
-                            return
-                        if choice == "yes":
-                            state["stage"] = "await_media"
-                            await call.message.answer(
-                                "Отправь фото или видео для рассылки (можно с подписью)."
-                            )
-                            await call.answer()
-                            return
-                        if choice == "no":
-                            state["stage"] = "ask_time"
-                            await _admin_ask_time(call.message, user.id)
-                            await call.answer()
-                            return
-
-                    # выбор времени
-                    if sub == "time":
-                        if len(parts) < 4:
-                            await call.answer("Некорректная команда", show_alert=True)
-                            return
-                        choice = parts[3]
-                        state = broadcast_state.get(user.id)
-                        if not state or state.get("tenant_id") != tenant_id:
-                            await call.answer("Нет активной рассылки", show_alert=True)
-                            return
-                        if choice == "now":
-                            text_val = str(state.get("text") or "")
-                            media_val = state.get("media")  # type: ignore[assignment]
-                            seg = str(state.get("segment"))
-                            code = state.get("lang_code")
-                            broadcast_state.pop(user.id, None)
-                            sent, failed = await _admin_do_broadcast(
-                                call.message.bot,
-                                call.message.chat.id,
-                                tenant_id,
-                                seg,
-                                code,  # type: ignore[arg-type]
-                                text_val,
-                                media_val,  # type: ignore[arg-type]
-                            )
-                            await call.message.answer(
-                                t_admin("broadcast_done", sent=sent, failed=failed)
-                            )
-                            await call.answer()
-                            return
-                        if choice == "later":
-                            state["stage"] = "await_time"
-                            await call.message.answer(
-                                t_admin("broadcast_time_hint")
-                            )
-                            await call.answer()
-                            return
-
-                    # отмена
-                    if sub == "cancel":
-                        broadcast_state.pop(user.id, None)
-                        await call.message.answer(t_admin("broadcast_cancelled"))
-                        await call.answer()
-                        return
-
-                # ---- статистика ----
-                if cmd == "stats":
-                    await _admin_show_stats(call, tenant_id)
-                    return
-
-                await call.answer("Неизвестная команда", show_alert=True)
-
-            # ---------- обработка текстов ----------
-
-            @router.message(F.text)
-            async def handle_text(message: Message) -> None:
-                text = (message.text or "").strip()
-                if not text:
-                    return
-
-                user = message.from_user
-                if user is None:
-                    return
-
-                # поиск пользователя
-                tid_search = search_user_waiting.pop(user.id, None)
-                if (
-                        tid_search is not None
-                        and tid_search == tenant_id
-                        and await _is_tenant_admin(tenant_id, user.id)
-                ):
-                    await _admin_search_and_show_user(message, tenant_id, text)
-                    return
-
-                # ввод ссылки
-                link_state = link_waiting.pop(user.id, None)
-                if (
-                        link_state is not None
-                        and link_state[0] == tenant_id
-                        and await _is_tenant_admin(tenant_id, user.id)
-                ):
-                    field = link_state[1]
-                    ok = await _admin_update_link_value(tenant_id, field, text)
-                    if not ok:
-                        await message.answer("Не удалось сохранить значение.")
-                    else:
-                        await _admin_send_links_message(message, tenant_id)
-                    return
-
-                # шаги рассылки
-                state = broadcast_state.get(user.id)
-                if (
-                        state is not None
-                        and state.get("tenant_id") == tenant_id
-                        and await _is_tenant_admin(tenant_id, user.id)
-                ):
-                    stage = state.get("stage")
-
-                    # ожидаем текст рассылки
-                    if stage == "await_text":
-                        state["text"] = text
-                        state["stage"] = "ask_media"
-                        await message.answer(
-                            t_admin("broadcast_media_question"),
-                            reply_markup=_admin_broadcast_media_kb(),
-                        )
-                        return
-
-                    # ожидаем время по МСК
-                    if stage == "await_time":
-                        try:
-                            hour_str, min_str = text.split(":", 1)
-                            hour = int(hour_str)
-                            minute = int(min_str)
-                            tz = ZoneInfo("Europe/Moscow")
-                            now_msk = dt.datetime.now(tz)
-                            target = now_msk.replace(
-                                hour=hour,
-                                minute=minute,
-                                second=0,
-                                microsecond=0,
-                            )
-                            if target <= now_msk:
-                                target = target + dt.timedelta(days=1)
-                            delay = (target - now_msk).total_seconds()
-                        except Exception:  # noqa: BLE001
-                            await message.answer(t_admin("broadcast_time_parse_error"))
-                            return
-
-                        text_val = str(state.get("text") or "")
-                        media_val = state.get("media")  # type: ignore[assignment]
-                        seg = str(state.get("segment"))
-                        code = state.get("lang_code")
-                        broadcast_state.pop(user.id, None)
-
-                        asyncio.create_task(
-                            _scheduled_broadcast(
-                                message.bot,
-                                message.chat.id,
-                                tenant_id,
-                                seg,
-                                code,  # type: ignore[arg-type]
-                                text_val,
-                                media_val,  # type: ignore[arg-type]
-                                delay,
-                            )
-                        )
-
-                        await message.answer(
-                            t_admin("broadcast_scheduled", time=text)
-                        )
-                        return
-
-                # обычный пользовательский фоллбек
-                lang = await _get_user_lang(tenant_id, user.id)
-                if lang is None:
-                    await _send_lang_menu(message)
-                else:
-                    await _send_main_menu(message, tenant_id, lang)
-
-            # ---------- медиа (для рассылок) ----------
-
-            @router.message(F.photo | F.video | F.document | F.animation)
-            async def handle_media(message: Message) -> None:
-                user = message.from_user
-                if user is None:
-                    return
-
-                state = broadcast_state.get(user.id)
-                if (
-                        state is not None
-                        and state.get("tenant_id") == tenant_id
-                        and await _is_tenant_admin(tenant_id, user.id)
-                ):
-                    stage = state.get("stage")
-                    if stage == "await_media":
-                        media: dict | None = None
-                        if message.photo:
-                            file_id = message.photo[-1].file_id
-                            media = {"type": "photo", "file_id": file_id}
-                        elif message.video:
-                            media = {"type": "video", "file_id": message.video.file_id}
-                        elif message.document:
-                            media = {"type": "document", "file_id": message.document.file_id}
-                        elif message.animation:
-                            media = {"type": "animation", "file_id": message.animation.file_id}
-
-                        state["media"] = media
-                        state["stage"] = "ask_time"
-                        await _admin_ask_time(message, user.id)
-                        return
-
-                # если это не часть рассылки — пока игнорируем
-
-            return router
-
-        # ---------------------------------------------------------------------------
-        # entrypoint
-        # ---------------------------------------------------------------------------
-
-        async def run_child_bot(bot_token: str, tenant_id: int) -> None:
-            tenant = await _get_tenant(tenant_id)
-            if tenant is None:
-                logger.error("Tenant %s not found, child bot will not start", tenant_id)
+    @router.callback_query(F.data == "menu:lang")
+    async def cb_menu_lang(call: CallbackQuery) -> None:
+        await _send_lang_menu(call.message)
+        await call.answer()
+
+    @router.callback_query(F.data == "menu:instruction")
+    async def cb_menu_instruction(call: CallbackQuery) -> None:
+        user = call.from_user
+        if user is None:
+            await call.answer()
+            return
+        lang = await _get_user_lang(tenant_id, user.id) or settings.lang_default
+        await _send_instruction(call.message, lang)
+        await call.answer()
+
+    @router.callback_query(F.data == "menu:back")
+    async def cb_menu_back(call: CallbackQuery) -> None:
+        user = call.from_user
+        if user is None:
+            await call.answer()
+            return
+        lang = await _get_user_lang(tenant_id, user.id) or settings.lang_default
+        await _send_main_menu(call.message, tenant_id, lang)
+        await call.answer()
+
+    # ---------- «Получить сигнал» + signal:... ----------
+
+    @router.callback_query(F.data == "menu:signal")
+    async def cb_menu_signal(call: CallbackQuery) -> None:
+        user = call.from_user
+        if user is None:
+            await call.answer()
+            return
+
+        await _handle_signal_flow(
+            call.message.bot,
+            call.message,
+            tenant_id=tenant_id,
+            user_id=user.id,
+        )
+        await call.answer()
+
+    @router.callback_query(F.data == "signal:sub_ok")
+    async def cb_signal_sub_ok(call: CallbackQuery) -> None:
+        """
+        Нажали «Я подписался» — проверяем подписку и идём дальше по цепочке.
+        """
+        user = call.from_user
+        if user is None:
+            await call.answer()
+            return
+
+        tenant = await _get_tenant(tenant_id)
+        if tenant is None:
+            await call.answer("Тенант не найден", show_alert=True)
+            return
+
+        is_sub = await _check_subscription(call.message.bot, tenant, user.id)
+        if not is_sub:
+            await call.answer(
+                "Я не вижу тебя в канале. Подпишись и попробуй ещё раз.",
+                show_alert=True,
+            )
+            return
+
+        # раз подписка есть — двигаем цепочку дальше
+        await _handle_signal_flow(
+            call.message.bot,
+            call.message,
+            tenant_id=tenant_id,
+            user_id=user.id,
+        )
+        await call.answer()
+
+    @router.callback_query(F.data == "signal:open_app")
+    async def cb_signal_open_app(call: CallbackQuery) -> None:
+        # исторический callback, оставлен для совместимости;
+        # сейчас ничего не делает, чтобы не спамить лишними сообщениями.
+        user = call.from_user
+        if user is None:
+            await call.answer()
+            return
+
+        lang = await _get_user_lang(tenant_id, user.id) or settings.lang_default
+        await _open_miniapp(call.message, lang)
+        await call.answer()
+
+    # ---------- админка ----------
+
+    @router.message(Command("admin"))
+    async def cmd_admin(message: Message) -> None:
+        user = message.from_user
+        if user is None:
+            return
+
+        if not await _is_tenant_admin(tenant_id, user.id):
+            await message.answer(t_admin("no_admin"))
+            return
+
+        await message.answer(
+            t_admin("menu"),
+            reply_markup=_admin_menu_kb(),
+        )
+
+    @router.callback_query(F.data.startswith("adm:"))
+    async def cb_admin(call: CallbackQuery) -> None:
+        user = call.from_user
+        if user is None:
+            await call.answer()
+            return
+
+        if not await _is_tenant_admin(tenant_id, user.id):
+            await call.answer("Нет доступа", show_alert=True)
+            return
+
+        data = call.data
+        parts = data.split(":")
+
+        if len(parts) == 1:
+            await call.answer("Неизвестная команда", show_alert=True)
+            return
+
+        cmd = parts[1]
+
+        if cmd == "back":
+            await call.message.edit_text(
+                t_admin("menu"),
+                reply_markup=_admin_menu_kb(),
+            )
+            await call.answer()
+            return
+
+        # ---- пользователи ----
+        if cmd == "users":
+            if len(parts) == 2:
+                page = 1
+                await _admin_show_users(call, tenant_id, page)
                 return
 
-            bot = Bot(
-                token=bot_token,
-                default=DefaultBotProperties(parse_mode="HTML"),
-            )
-            dp = Dispatcher()
-            dp.include_router(make_child_router(tenant_id))
+            sub = parts[2]
+            if sub == "page":
+                try:
+                    page = int(parts[3])
+                except (IndexError, ValueError):
+                    page = 1
+                await _admin_show_users(call, tenant_id, page)
+                return
+            if sub == "search":
+                search_user_waiting[user.id] = tenant_id
+                await call.message.answer(
+                    "Отправь <code>tg_id</code> или <code>trader_id</code> пользователя,"
+                    " и я покажу его карточку."
+                )
+                await call.answer()
+                return
 
-            logger.info("Starting child bot for tenant %s", tenant_id)
+        # ---- отдельный пользователь ----
+        if cmd == "user":
+            if len(parts) < 4:
+                await call.answer("Некорректная команда", show_alert=True)
+                return
+            action = parts[2]
             try:
-                await dp.start_polling(bot)
-            except Exception as e:  # noqa: BLE001
-                logger.exception("Child bot for tenant %s crashed: %s", tenant_id, e)
-            finally:
-                await bot.session.close()
-                logger.info("Child bot for tenant %s stopped", tenant_id)
+                uid = int(parts[3])
+            except ValueError:
+                await call.answer("Некорректный user_id", show_alert=True)
+                return
+
+            if action == "show":
+                await _admin_show_user_card(call, tenant_id, uid)
+                return
+            if action in ("reg", "dep"):
+                ok = await _admin_toggle_user_flag(tenant_id, uid, action)
+                if not ok:
+                    await call.answer("Пользователь не найден", show_alert=True)
+                    return
+                await _admin_show_user_card(call, tenant_id, uid)
+                return
+            if action == "del":
+                await _admin_delete_user_record(tenant_id, uid)
+                await call.message.edit_text("Пользователь удалён.")
+                await call.answer()
+                return
+
+        # ---- постбэки (экран с URL) ----
+        if cmd == "events":
+            await _admin_show_postbacks(call, tenant_id)
+            return
+
+        # ---- параметры ----
+        if cmd == "params":
+            if len(parts) == 2:
+                await _admin_show_params(call, tenant_id)
+                return
+            action = parts[2]
+            if action in ("sub", "dep"):
+                ok = await _admin_toggle_param(tenant_id, action)
+                if not ok:
+                    await call.answer("Не удалось изменить параметр", show_alert=True)
+                    return
+                await _admin_show_params(call, tenant_id)
+                return
+
+        # ---- ссылки ----
+        if cmd == "links":
+            if len(parts) == 2:
+                await _admin_show_links(call, tenant_id)
+                return
+            sub = parts[2]
+            if sub == "set":
+                if len(parts) < 4:
+                    await call.answer("Некорректная команда", show_alert=True)
+                    return
+                field = parts[3]
+                link_waiting[user.id] = (tenant_id, field)
+
+                if field == "ref":
+                    text = "Отправь новую реф-ссылку (полный URL)."
+                elif field == "dep":
+                    text = "Отправь ссылку на депозит (URL)."
+                elif field == "support":
+                    text = "Отправь URL поддержки."
+                elif field == "chanid":
+                    text = "Отправь ID канала (например, -1001234567890)."
+                elif field == "chanurl":
+                    text = "Отправь URL канала."
+                else:
+                    await call.answer("Неизвестное поле", show_alert=True)
+                    return
+
+                await call.message.answer(
+                    text + "\nЕсли хочешь очистить, отправь «-»."
+                )
+                await call.answer()
+                return
+
+        # ---- рассылки ----
+        if cmd == "bc":
+            # adm:bc -> выбор сегмента
+            if len(parts) == 2:
+                await _admin_start_broadcast_menu(call, tenant_id)
+                return
+
+            sub = parts[2]
+
+            # выбор сегмента
+            if sub == "seg":
+                if len(parts) < 4:
+                    await call.answer("Некорректная команда", show_alert=True)
+                    return
+                seg = parts[3]
+                if seg == "lang":
+                    # дальше выбираем язык
+                    broadcast_state[user.id] = {
+                        "tenant_id": tenant_id,
+                        "segment": "lang",
+                        "lang_code": None,
+                        "stage": "await_lang",
+                        "text": None,
+                        "media": None,
+                    }
+                    await call.message.edit_text(
+                        "Выбери язык для рассылки:",
+                        reply_markup=_admin_broadcast_lang_kb(),
+                    )
+                    await call.answer()
+                    return
+
+                if seg in ("all", "reg", "dep"):
+                    broadcast_state[user.id] = {
+                        "tenant_id": tenant_id,
+                        "segment": seg,
+                        "lang_code": None,
+                        "stage": "await_text",
+                        "text": None,
+                        "media": None,
+                    }
+                    await call.message.answer(t_admin("broadcast_prompt"))
+                    await call.answer()
+                    return
+
+            # выбор языка для сегмента lang
+            if sub == "lang":
+                if len(parts) < 4:
+                    await call.answer("Некорректная команда", show_alert=True)
+                    return
+                code = parts[3]
+                if code not in LANGS:
+                    await call.answer("Неизвестный язык", show_alert=True)
+                    return
+                broadcast_state[user.id] = {
+                    "tenant_id": tenant_id,
+                    "segment": "lang",
+                    "lang_code": code,
+                    "stage": "await_text",
+                    "text": None,
+                    "media": None,
+                }
+                await call.message.answer(
+                    t_admin("broadcast_prompt")
+                    + f"\n\nВыбран язык: {NATIVE_LANG_NAMES.get(code, code)}"
+                )
+                await call.answer()
+                return
+
+            # вопрос про медиа
+            if sub == "media":
+                if len(parts) < 4:
+                    await call.answer("Некорректная команда", show_alert=True)
+                    return
+                choice = parts[3]
+                state = broadcast_state.get(user.id)
+                if not state or state.get("tenant_id") != tenant_id:
+                    await call.answer("Нет активной рассылки", show_alert=True)
+                    return
+                if choice == "yes":
+                    state["stage"] = "await_media"
+                    await call.message.answer(
+                        "Отправь фото или видео для рассылки (можно с подписью)."
+                    )
+                    await call.answer()
+                    return
+                if choice == "no":
+                    state["stage"] = "ask_time"
+                    await _admin_ask_time(call.message, user.id)
+                    await call.answer()
+                    return
+
+            # выбор времени
+            if sub == "time":
+                if len(parts) < 4:
+                    await call.answer("Некорректная команда", show_alert=True)
+                    return
+                choice = parts[3]
+                state = broadcast_state.get(user.id)
+                if not state or state.get("tenant_id") != tenant_id:
+                    await call.answer("Нет активной рассылки", show_alert=True)
+                    return
+                if choice == "now":
+                    text_val = str(state.get("text") or "")
+                    media_val = state.get("media")  # type: ignore[assignment]
+                    seg = str(state.get("segment"))
+                    code = state.get("lang_code")
+                    broadcast_state.pop(user.id, None)
+                    sent, failed = await _admin_do_broadcast(
+                        call.message.bot,
+                        call.message.chat.id,
+                        tenant_id,
+                        seg,
+                        code,  # type: ignore[arg-type]
+                        text_val,
+                        media_val,  # type: ignore[arg-type]
+                    )
+                    await call.message.answer(
+                        t_admin("broadcast_done", sent=sent, failed=failed)
+                    )
+                    await call.answer()
+                    return
+                if choice == "later":
+                    state["stage"] = "await_time"
+                    await call.message.answer(
+                        t_admin("broadcast_time_hint")
+                    )
+                    await call.answer()
+                    return
+
+            # отмена
+            if sub == "cancel":
+                broadcast_state.pop(user.id, None)
+                await call.message.answer(t_admin("broadcast_cancelled"))
+                await call.answer()
+                return
+
+        # ---- статистика ----
+        if cmd == "stats":
+            await _admin_show_stats(call, tenant_id)
+            return
+
+        await call.answer("Неизвестная команда", show_alert=True)
+
+    # ---------- обработка текстов ----------
+
+    @router.message(F.text)
+    async def handle_text(message: Message) -> None:
+        text = (message.text or "").strip()
+        if not text:
+            return
+
+        user = message.from_user
+        if user is None:
+            return
+
+        # поиск пользователя
+        tid_search = search_user_waiting.pop(user.id, None)
+        if (
+            tid_search is not None
+            and tid_search == tenant_id
+            and await _is_tenant_admin(tenant_id, user.id)
+        ):
+            await _admin_search_and_show_user(message, tenant_id, text)
+            return
+
+        # ввод ссылки
+        link_state = link_waiting.pop(user.id, None)
+        if (
+            link_state is not None
+            and link_state[0] == tenant_id
+            and await _is_tenant_admin(tenant_id, user.id)
+        ):
+            field = link_state[1]
+            ok = await _admin_update_link_value(tenant_id, field, text)
+            if not ok:
+                await message.answer("Не удалось сохранить значение.")
+            else:
+                await _admin_send_links_message(message, tenant_id)
+            return
+
+        # шаги рассылки
+        state = broadcast_state.get(user.id)
+        if (
+            state is not None
+            and state.get("tenant_id") == tenant_id
+            and await _is_tenant_admin(tenant_id, user.id)
+        ):
+            stage = state.get("stage")
+
+            # ожидаем текст рассылки
+            if stage == "await_text":
+                state["text"] = text
+                state["stage"] = "ask_media"
+                await message.answer(
+                    t_admin("broadcast_media_question"),
+                    reply_markup=_admin_broadcast_media_kb(),
+                )
+                return
+
+            # ожидаем время по МСК
+            if stage == "await_time":
+                try:
+                    hour_str, min_str = text.split(":", 1)
+                    hour = int(hour_str)
+                    minute = int(min_str)
+                    tz = ZoneInfo("Europe/Moscow")
+                    now_msk = dt.datetime.now(tz)
+                    target = now_msk.replace(
+                        hour=hour,
+                        minute=minute,
+                        second=0,
+                        microsecond=0,
+                    )
+                    if target <= now_msk:
+                        target = target + dt.timedelta(days=1)
+                    delay = (target - now_msk).total_seconds()
+                except Exception:  # noqa: BLE001
+                    await message.answer(t_admin("broadcast_time_parse_error"))
+                    return
+
+                text_val = str(state.get("text") or "")
+                media_val = state.get("media")  # type: ignore[assignment]
+                seg = str(state.get("segment"))
+                code = state.get("lang_code")
+                broadcast_state.pop(user.id, None)
+
+                asyncio.create_task(
+                    _scheduled_broadcast(
+                        message.bot,
+                        message.chat.id,
+                        tenant_id,
+                        seg,
+                        code,  # type: ignore[arg-type]
+                        text_val,
+                        media_val,  # type: ignore[arg-type]
+                        delay,
+                    )
+                )
+
+                await message.answer(
+                    t_admin("broadcast_scheduled", time=text)
+                )
+                return
+
+        # обычный пользовательский фоллбек
+        lang = await _get_user_lang(tenant_id, user.id)
+        if lang is None:
+            await _send_lang_menu(message)
+        else:
+            await _send_main_menu(message, tenant_id, lang)
+
+    # ---------- медиа (для рассылок) ----------
+
+    @router.message(F.photo | F.video | F.document | F.animation)
+    async def handle_media(message: Message) -> None:
+        user = message.from_user
+        if user is None:
+            return
+
+        state = broadcast_state.get(user.id)
+        if (
+            state is not None
+            and state.get("tenant_id") == tenant_id
+            and await _is_tenant_admin(tenant_id, user.id)
+        ):
+            stage = state.get("stage")
+            if stage == "await_media":
+                media: dict | None = None
+                if message.photo:
+                    file_id = message.photo[-1].file_id
+                    media = {"type": "photo", "file_id": file_id}
+                elif message.video:
+                    media = {"type": "video", "file_id": message.video.file_id}
+                elif message.document:
+                    media = {"type": "document", "file_id": message.document.file_id}
+                elif message.animation:
+                    media = {"type": "animation", "file_id": message.animation.file_id}
+
+                state["media"] = media
+                state["stage"] = "ask_time"
+                await _admin_ask_time(message, user.id)
+                return
+
+        # если это не часть рассылки — пока игнорируем
+
+    return router
+
+
+# ---------------------------------------------------------------------------
+# entrypoint
+# ---------------------------------------------------------------------------
+
+async def run_child_bot(bot_token: str, tenant_id: int) -> None:
+    tenant = await _get_tenant(tenant_id)
+    if tenant is None:
+        logger.error("Tenant %s not found, child bot will not start", tenant_id)
+        return
+
+    bot = Bot(
+        token=bot_token,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
+    dp = Dispatcher()
+    dp.include_router(make_child_router(tenant_id))
+
+    logger.info("Starting child bot for tenant %s", tenant_id)
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Child bot for tenant %s crashed: %s", tenant_id, e)
+    finally:
+        await bot.session.close()
+        logger.info("Child bot for tenant %s stopped", tenant_id)

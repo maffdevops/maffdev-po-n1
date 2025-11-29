@@ -26,10 +26,10 @@ logger = logging.getLogger("pocket_saas.parent")
 
 router = Router()
 
-# Простейшая проверка формата токена бота
+# Проверка формата токена бота
 TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_\-]{20,}$")
 
-# состояние глобальной рассылки для GA: admin_id -> state
+# Состояние рассылки для GA: admin_id -> state
 ga_broadcast_state: Dict[int, Dict[str, Any]] = {}
 
 
@@ -82,8 +82,6 @@ async def _get_owner_tenant(owner_id: int) -> Optional[Tenant]:
 async def _save_tenant(owner_id: int, token: str, username: Optional[str]) -> Tenant:
     """
     Создаём или обновляем ТОЛЬКО ОДНОГО тенанта на человека.
-
-    Если у owner уже есть запись — обновляем в ней токен/username.
     """
     async with SessionLocal() as session:
         res = await session.execute(
@@ -150,6 +148,17 @@ async def _list_all_active_tenant_user_ids() -> List[int]:
         return [row[0] for row in res_u.all()]
 
 
+async def _list_tenant_user_ids(tenant_id: int) -> List[int]:
+    """Все пользователи одного тенанта."""
+    async with SessionLocal() as session:
+        res_u = await session.execute(
+            select(UserAccess.user_id)
+            .where(UserAccess.tenant_id == tenant_id)
+            .distinct()
+        )
+        return [row[0] for row in res_u.all()]
+
+
 async def _get_tenants_page(page: int, page_size: int = 5) -> tuple[List[Tenant], int]:
     """
     Возвращает список тенантов и общее количество страниц.
@@ -209,7 +218,6 @@ async def _get_tenant_stats(tenant_id: int) -> tuple[int, int, int]:
 async def _resolve_owner_username(bot: Bot, owner_id: int) -> Optional[str]:
     """
     Пытаемся получить username владельца по его Telegram ID.
-    Если не выйдет — вернём None.
     """
     try:
         chat = await bot.get_chat(owner_id)
@@ -357,8 +365,14 @@ async def cmd_stas(message: Message) -> None:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📢 Глобальная рассылка",
-                    callback_data="ga:bc",
+                    text="📢 Рассылка всем пользователям",
+                    callback_data="ga:bc_all",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📤 Рассылка по тенанту",
+                    callback_data="ga:bc_select_tenant",
                 )
             ],
             [
@@ -372,8 +386,9 @@ async def cmd_stas(message: Message) -> None:
 
     await message.answer(
         "👑 Главное меню глобального админа.\n\n"
-        "• «Глобальная рассылка» — по всем пользователям всех активных ботов.\n"
-        "• «Клиенты» — список тенантов с карточками и удалением.",
+        "• «Рассылка всем пользователям» — по всем юзерам всех активных ботов.\n"
+        "• «Рассылка по тенанту» — только пользователям выбранного клиента.\n"
+        "• «Клиенты» — список тенантов, карточки и удаление.",
         reply_markup=kb,
     )
 
@@ -507,6 +522,12 @@ async def _ga_show_tenant_card(call: CallbackQuery, tenant_id: int) -> None:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
+                    text="📤 Рассылка пользователям этого тенанта",
+                    callback_data=f"ga:bc_tenant:{tenant.id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="🗑 Удалить клиента (с концами)",
                     callback_data=f"ga:tenantdel:{tenant.id}",
                 )
@@ -545,30 +566,83 @@ async def _ga_delete_tenant_handler(call: CallbackQuery, tenant_id: int) -> None
     await call.answer()
 
 
+@router.callback_query(F.data.startswith("ga:tenants:"))
+async def cb_ga_tenants(call: CallbackQuery) -> None:
+    user = call.from_user
+    if user is None:
+        await call.answer()
+        return
+    if not _is_ga(user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        _, _, page_str = call.data.split(":", 2)
+        page = int(page_str)
+    except (ValueError, IndexError):
+        page = 1
+
+    await _ga_show_tenants_page(call, page)
+
+
+@router.callback_query(F.data.startswith("ga:tenant:"))
+async def cb_ga_tenant(call: CallbackQuery) -> None:
+    user = call.from_user
+    if user is None:
+        await call.answer()
+        return
+    if not _is_ga(user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        _, _, tid_str = call.data.split(":", 2)
+        tenant_id = int(tid_str)
+    except (ValueError, IndexError):
+        await call.answer("Некорректный tenant_id", show_alert=True)
+        return
+
+    await _ga_show_tenant_card(call, tenant_id)
+
+
+@router.callback_query(F.data.startswith("ga:tenantdel:"))
+async def cb_ga_tenantdel(call: CallbackQuery) -> None:
+    user = call.from_user
+    if user is None:
+        await call.answer()
+        return
+    if not _is_ga(user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        _, tid_str = call.data.split("ga:tenantdel:")
+        tenant_id = int(tid_str)
+    except ValueError:
+        await call.answer("Некорректный tenant_id", show_alert=True)
+        return
+
+    await _ga_delete_tenant_handler(call, tenant_id)
+
+
 # ---------------------------------------------------------------------------
-# GA: глобальная рассылка
+# GA: мощная рассылка (всем / по одному тенанту)
 # ---------------------------------------------------------------------------
 
 
-def _ga_bc_media_kb() -> InlineKeyboardMarkup:
+def _ga_bc_finish_msgs_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="➕ Добавить медиа",
-                    callback_data="ga:bc:media:yes",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="➡️ Без медиа",
-                    callback_data="ga:bc:media:no",
+                    text="➡️ Перейти к настройке времени",
+                    callback_data="ga:bc_done_msgs",
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="✖️ Отмена",
-                    callback_data="ga:bc:cancel",
+                    callback_data="ga:bc_cancel",
                 )
             ],
         ]
@@ -581,44 +655,55 @@ def _ga_bc_time_kb() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="🚀 Отправить сейчас",
-                    callback_data="ga:bc:time:now",
+                    callback_data="ga:bc_time:now",
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="⏰ Запланировать по времени (МСК)",
-                    callback_data="ga:bc:time:later",
+                    callback_data="ga:bc_time:later",
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="✖️ Отмена",
-                    callback_data="ga:bc:cancel",
+                    callback_data="ga:bc_cancel",
                 )
             ],
         ]
     )
 
 
-async def _ga_bc_ask_time(message: Message, admin_id: int) -> None:
+async def _ga_bc_ask_time(message: Message) -> None:
     await message.answer(
         "Когда отправить рассылку?",
         reply_markup=_ga_bc_time_kb(),
     )
 
 
-async def _ga_do_broadcast(
+async def _collect_target_user_ids(target_type: str, tenant_id: Optional[int]) -> List[int]:
+    if target_type == "all":
+        return await _list_all_active_tenant_user_ids()
+    if target_type == "tenant" and tenant_id is not None:
+        return await _list_tenant_user_ids(tenant_id)
+    return []
+
+
+async def _ga_do_broadcast_posts(
     bot: Bot,
     admin_chat_id: int,
-    text: str,
-    media: Optional[dict],
+    target_type: str,
+    tenant_id: Optional[int],
+    messages: List[Dict[str, Any]],
 ) -> tuple[int, int]:
-    """Фактическая отправка по всем пользователям всех активных тенантов."""
-    user_ids = await _list_all_active_tenant_user_ids()
+    """
+    Фактическая отправка кампании (несколько постов) по целевой аудитории.
+    """
+    user_ids = await _collect_target_user_ids(target_type, tenant_id)
     if not user_ids:
         await bot.send_message(
             admin_chat_id,
-            "Нет ни одного пользователя в активных ботах — рассылать некому.",
+            "Нет ни одного пользователя под выбранную аудиторию — рассылать некому.",
         )
         return 0, 0
 
@@ -626,166 +711,68 @@ async def _ga_do_broadcast(
     failed = 0
 
     for uid in user_ids:
-        try:
-            if media is None:
-                await bot.send_message(uid, text)
-            else:
-                mtype = media.get("type")
-                file_id = media.get("file_id")
-                if mtype == "photo":
-                    await bot.send_photo(uid, file_id, caption=text or None)
-                elif mtype == "video":
-                    await bot.send_video(uid, file_id, caption=text or None)
-                elif mtype == "document":
-                    await bot.send_document(uid, file_id, caption=text or None)
-                elif mtype == "animation":
-                    await bot.send_animation(uid, file_id, caption=text or None)
-                else:
+        for post in messages:
+            text = str(post.get("text") or "")
+            media = post.get("media")
+            try:
+                if media is None:
                     await bot.send_message(uid, text)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except TelegramForbiddenError:
-            failed += 1
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            logger.warning("GA broadcast send error to %s: %s", uid, e)
+                else:
+                    mtype = media.get("type")
+                    file_id = media.get("file_id")
+                    if mtype == "photo":
+                        await bot.send_photo(uid, file_id, caption=text or None)
+                    elif mtype == "video":
+                        await bot.send_video(uid, file_id, caption=text or None)
+                    elif mtype == "document":
+                        await bot.send_document(uid, file_id, caption=text or None)
+                    elif mtype == "animation":
+                        await bot.send_animation(uid, file_id, caption=text or None)
+                    else:
+                        await bot.send_message(uid, text)
+                sent += 1
+                await asyncio.sleep(0.05)
+            except TelegramForbiddenError:
+                failed += 1
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                logger.warning("GA broadcast send error to %s: %s", uid, e)
 
     return sent, failed
 
 
-async def _ga_scheduled_broadcast(
+async def _ga_scheduled_broadcast_posts(
     bot: Bot,
     admin_chat_id: int,
-    text: str,
-    media: Optional[dict],
+    target_type: str,
+    tenant_id: Optional[int],
+    messages: List[Dict[str, Any]],
     delay_seconds: float,
 ) -> None:
     try:
         await asyncio.sleep(delay_seconds)
-        sent, failed = await _ga_do_broadcast(bot, admin_chat_id, text, media)
+        sent, failed = await _ga_do_broadcast_posts(
+            bot,
+            admin_chat_id,
+            target_type,
+            tenant_id,
+            messages,
+        )
         await bot.send_message(
             admin_chat_id,
-            "Глобальная рассылка завершена.\n"
-            f"✅ Успешно: <b>{sent}</b>\n"
+            "Рассылка по кампании завершена.\n"
+            f"✅ Отправлено сообщений: <b>{sent}</b>\n"
             f"⚠️ Ошибок: <b>{failed}</b>",
         )
     except Exception as e:  # noqa: BLE001
         logger.exception("Scheduled GA broadcast error: %s", e)
 
 
-@router.callback_query(F.data.startswith("ga:"))
-async def cb_ga(call: CallbackQuery) -> None:
-    """
-    Все колбэки префикса ga: — родительская админка.
-    """
-    user = call.from_user
-    if user is None:
-        await call.answer()
-        return
-    uid = user.id
-
-    parts = call.data.split(":")
-    # ga:...
-    if len(parts) < 2:
-        await call.answer("Некорректная команда", show_alert=True)
-        return
-
-    cmd = parts[1]
-
-    if cmd == "bc":
-        # старт глобальной рассылки
-        if not _is_ga(uid):
-            await call.answer("Нет доступа", show_alert=True)
-            return
-
-        ga_broadcast_state[uid] = {
-            "stage": "await_text",
-            "text": None,
-            "media": None,
-        }
-        await call.message.answer(
-            "✏️ Отправь текст рассылки одним сообщением.\n\n"
-            "После этого я спрошу, нужно ли добавить медиа и по времени/сразу."
-        )
-        await call.answer()
-        return
-
-    if cmd == "tenants":
-        # ga:tenants:<page>
-        if not _is_ga(uid):
-            await call.answer("Нет доступа", show_alert=True)
-            return
-        try:
-            page = int(parts[2])
-        except (IndexError, ValueError):
-            page = 1
-        await _ga_show_tenants_page(call, page)
-        return
-
-    if cmd == "tenant":
-        # ga:tenant:<id>
-        if not _is_ga(uid):
-            await call.answer("Нет доступа", show_alert=True)
-            return
-        try:
-            tenant_id = int(parts[2])
-        except (IndexError, ValueError):
-            await call.answer("Некорректный tenant_id", show_alert=True)
-            return
-        await _ga_show_tenant_card(call, tenant_id)
-        return
-
-    if cmd == "tenantdel":
-        # ga:tenantdel:<id>
-        if not _is_ga(uid):
-            await call.answer("Нет доступа", show_alert=True)
-            return
-        try:
-            tenant_id = int(parts[2])
-        except (IndexError, ValueError):
-            await call.answer("Некорректный tenant_id", show_alert=True)
-            return
-        await _ga_delete_tenant_handler(call, tenant_id)
-        return
-
-    # --- шаги глобальной рассылки ---
-
-    if cmd == "bc":
-        # уже обработали выше
-        await call.answer()
-        return
-
-    if cmd == "bc" and len(parts) >= 3:
-        # сюда не попадём, оставлено на всякий
-        await call.answer()
-        return
-
-    if cmd == "bc" or cmd == "ga":
-        await call.answer()
-        return
-
-    # ga:bc:media:yes|no
-    if cmd == "bc" and len(parts) >= 3 and parts[2] == "media":
-        # не используется в таком виде, оставлено для совместимости
-        await call.answer()
-        return
-
-    # общий обработчик подкоманд ga:bc:...
-    if parts[1] == "bc" or parts[1] == "ga":
-        # сюда не дойдём, потому что cmd == parts[1]
-        await call.answer()
-        return
-
-    # далее — обработка ga:bc:* вынесена в отдельные сравнения
-    # но, чтобы не запутаться, сделаем проще: распознаем по второму элементу
-
-    await call.answer("Неизвестная команда", show_alert=True)
+# --- вход в рассылки ---
 
 
-# Отдельно распарсим подробные колбэки для расслылки,
-# чтобы не превращать один хэндлер в ад:
-@router.callback_query(F.data.startswith("ga:bc:"))
-async def cb_ga_bc(call: CallbackQuery) -> None:
+@router.callback_query(F.data == "ga:bc_all")
+async def cb_ga_bc_all(call: CallbackQuery) -> None:
     user = call.from_user
     if user is None:
         await call.answer()
@@ -796,74 +783,159 @@ async def cb_ga_bc(call: CallbackQuery) -> None:
         await call.answer("Нет доступа", show_alert=True)
         return
 
-    parts = call.data.split(":")
-    # ga:bc:...
-    if len(parts) < 3:
-        await call.answer("Некорректная команда", show_alert=True)
+    # Сбрасываем старое состояние и начинаем новую кампанию
+    ga_broadcast_state[uid] = {
+        "target_type": "all",
+        "tenant_id": None,
+        "stage": "collect_msgs",
+        "messages": [],
+    }
+
+    await call.message.answer(
+        "Начинаем кампанию по <b>ВСЕМ пользователям</b>.\n\n"
+        "Отправь первый пост кампании (текст или медиа с подписью).\n"
+        "Каждый пост — отдельное сообщение.\n\n"
+        "Когда закончишь добавлять посты — нажми кнопку:",
+        reply_markup=_ga_bc_finish_msgs_kb(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "ga:bc_select_tenant")
+async def cb_ga_bc_select_tenant(call: CallbackQuery) -> None:
+    """
+    Просто открываем список клиентов — дальше из карточки можно запустить
+    рассылку по конкретному тенанту.
+    """
+    await cb_ga_tenants(call)  # показываем страницу 1 по тем же правилам
+
+
+@router.callback_query(F.data.startswith("ga:bc_tenant:"))
+async def cb_ga_bc_tenant(call: CallbackQuery) -> None:
+    """
+    Запуск кампании по одному тенанту.
+    """
+    user = call.from_user
+    if user is None:
+        await call.answer()
+        return
+    uid = user.id
+
+    if not _is_ga(uid):
+        await call.answer("Нет доступа", show_alert=True)
         return
 
-    sub = parts[2]
+    try:
+        _, _, tid_str = call.data.split(":", 2)
+        tenant_id = int(tid_str)
+    except (ValueError, IndexError):
+        await call.answer("Некорректный tenant_id", show_alert=True)
+        return
+
+    ga_broadcast_state[uid] = {
+        "target_type": "tenant",
+        "tenant_id": tenant_id,
+        "stage": "collect_msgs",
+        "messages": [],
+    }
+
+    await call.message.answer(
+        f"Кампания по пользователям тенанта <code>{tenant_id}</code>.\n\n"
+        "Отправь первый пост (текст или медиа с подписью).\n"
+        "Каждый пост — отдельное сообщение.\n\n"
+        "Когда закончишь добавлять посты — нажми кнопку:",
+        reply_markup=_ga_bc_finish_msgs_kb(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "ga:bc_done_msgs")
+async def cb_ga_bc_done_msgs(call: CallbackQuery) -> None:
+    user = call.from_user
+    if user is None:
+        await call.answer()
+        return
+    uid = user.id
+
     state = ga_broadcast_state.get(uid)
+    if state is None or state.get("stage") != "collect_msgs":
+        await call.answer("Нет активной кампании", show_alert=True)
+        return
 
-    if sub == "media":
-        if len(parts) < 4 or state is None:
-            await call.answer("Нет активной рассылки", show_alert=True)
-            return
-        choice = parts[3]
-        if choice == "yes":
-            state["stage"] = "await_media"
-            await call.message.answer(
-                "Отправь фото/видео/документ/гифку для рассылки (можно с подписью, но используем основной текст)."
-            )
-            await call.answer()
-            return
-        if choice == "no":
-            state["stage"] = "ask_time"
-            await _ga_bc_ask_time(call.message, uid)
-            await call.answer()
-            return
+    messages: List[Dict[str, Any]] = state.get("messages") or []
+    if not messages:
+        await call.answer("Сначала добавь хотя бы один пост", show_alert=True)
+        return
 
-    if sub == "time":
-        if len(parts) < 4 or state is None:
-            await call.answer("Нет активной рассылки", show_alert=True)
-            return
-        choice = parts[3]
-        text_val = str(state.get("text") or "")
-        media_val = state.get("media")  # type: ignore[assignment]
+    state["stage"] = "ask_time"
+    await _ga_bc_ask_time(call.message)
+    await call.answer()
 
-        if choice == "now":
-            ga_broadcast_state.pop(uid, None)
-            await call.message.answer("Начинаю глобальную рассылку…")
-            sent, failed = await _ga_do_broadcast(
-                call.message.bot,
-                call.message.chat.id,
-                text_val,
-                media_val,  # type: ignore[arg-type]
-            )
-            await call.message.answer(
-                "Глобальная рассылка завершена.\n"
-                f"✅ Успешно: <b>{sent}</b>\n"
-                f"⚠️ Ошибок: <b>{failed}</b>"
-            )
-            await call.answer()
-            return
 
-        if choice == "later":
-            state["stage"] = "await_time"
-            await call.message.answer(
-                "Отправь время по МСК в формате ЧЧ:ММ, например 15:30.\n"
-                "Если время уже прошло, отправим на следующий день."
-            )
-            await call.answer()
-            return
+@router.callback_query(F.data.startswith("ga:bc_time:"))
+async def cb_ga_bc_time(call: CallbackQuery) -> None:
+    user = call.from_user
+    if user is None:
+        await call.answer()
+        return
+    uid = user.id
 
-    if sub == "cancel":
+    state = ga_broadcast_state.get(uid)
+    if state is None:
+        await call.answer("Нет активной кампании", show_alert=True)
+        return
+
+    choice = call.data.split(":", 2)[2]
+    target_type = str(state.get("target_type"))
+    tenant_id = state.get("tenant_id")
+    messages: List[Dict[str, Any]] = state.get("messages") or []
+
+    if not messages:
+        await call.answer("Нет постов для рассылки", show_alert=True)
+        return
+
+    if choice == "now":
+        # сразу отправляем
         ga_broadcast_state.pop(uid, None)
-        await call.message.answer("Глобальная рассылка отменена.")
+        await call.message.answer("Начинаю рассылку кампании…")
+        sent, failed = await _ga_do_broadcast_posts(
+            call.message.bot,
+            call.message.chat.id,
+            target_type,
+            tenant_id,  # type: ignore[arg-type]
+            messages,
+        )
+        await call.message.answer(
+            "Рассылка по кампании завершена.\n"
+            f"✅ Отправлено сообщений: <b>{sent}</b>\n"
+            f"⚠️ Ошибок: <b>{failed}</b>"
+        )
+        await call.answer()
+        return
+
+    if choice == "later":
+        state["stage"] = "await_time"
+        await call.message.answer(
+            "Отправь время по МСК в формате ЧЧ:ММ, например 15:30.\n"
+            "Если время уже прошло, отправим на следующий день."
+        )
         await call.answer()
         return
 
     await call.answer("Неизвестная команда", show_alert=True)
+
+
+@router.callback_query(F.data == "ga:bc_cancel")
+async def cb_ga_bc_cancel(call: CallbackQuery) -> None:
+    user = call.from_user
+    if user is None:
+        await call.answer()
+        return
+    uid = user.id
+
+    ga_broadcast_state.pop(uid, None)
+    await call.message.answer("Кампания рассылки отменена.")
+    await call.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -882,23 +954,27 @@ async def handle_text(message: Message) -> None:
         return
     uid = user.id
 
-    # --- шаги глобальной рассылки для GA ---
+    # --- если GA сейчас собирает кампанию ---
     state = ga_broadcast_state.get(uid)
     if state is not None and _is_ga(uid):
         stage = state.get("stage")
 
-        if stage == "await_text":
-            state["text"] = text
-            state["stage"] = "ask_media"
+        # собираем текстовые посты
+        if stage == "collect_msgs":
+            messages: List[Dict[str, Any]] = state.get("messages") or []
+            messages.append({"text": text, "media": None})
+            state["messages"] = messages
+
             await message.answer(
-                "Текст сохранён.\n\n"
-                "Хочешь добавить медиа к рассылке?",
-                reply_markup=_ga_bc_media_kb(),
+                f"Пост #{len(messages)} сохранён (только текст).\n\n"
+                "Отправь следующий пост (текст или медиа), "
+                "или нажми «Перейти к настройке времени».",
+                reply_markup=_ga_bc_finish_msgs_kb(),
             )
             return
 
+        # ожидаем время
         if stage == "await_time":
-            # ждём время формата ЧЧ:ММ по МСК
             try:
                 hour_str, min_str = text.split(":", 1)
                 hour = int(hour_str)
@@ -920,26 +996,29 @@ async def handle_text(message: Message) -> None:
                 )
                 return
 
-            text_val = str(state.get("text") or "")
-            media_val = state.get("media")  # type: ignore[assignment]
+            target_type = str(state.get("target_type"))
+            tenant_id = state.get("tenant_id")
+            messages_list: List[Dict[str, Any]] = state.get("messages") or []
+
             ga_broadcast_state.pop(uid, None)
 
             asyncio.create_task(
-                _ga_scheduled_broadcast(
+                _ga_scheduled_broadcast_posts(
                     message.bot,
                     message.chat.id,
-                    text_val,
-                    media_val,  # type: ignore[arg-type]
+                    target_type,
+                    tenant_id,  # type: ignore[arg-type]
+                    messages_list,
                     delay,
                 )
             )
 
             await message.answer(
-                f"Глобальная рассылка запланирована на {text} по МСК ✅"
+                f"Кампания запланирована на {text} по МСК ✅"
             )
             return
 
-    # --- если это GA, но не в рассылке — может быть токен бота ---
+    # --- если это GA, но не в кампании — может быть токен бота ---
     if TOKEN_RE.match(text):
         await _handle_new_bot_token(message, text)
         return
@@ -953,7 +1032,7 @@ async def handle_text(message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
-# медиа для глобальной рассылки
+# медиа для кампаний (фото, видео, документы, гифки)
 # ---------------------------------------------------------------------------
 
 
@@ -965,7 +1044,7 @@ async def handle_media(message: Message) -> None:
     uid = user.id
 
     state = ga_broadcast_state.get(uid)
-    if state is not None and _is_ga(uid) and state.get("stage") == "await_media":
+    if state is not None and _is_ga(uid) and state.get("stage") == "collect_msgs":
         media: Optional[dict] = None
         if message.photo:
             file_id = message.photo[-1].file_id
@@ -977,12 +1056,21 @@ async def handle_media(message: Message) -> None:
         elif message.animation:
             media = {"type": "animation", "file_id": message.animation.file_id}
 
-        state["media"] = media
-        state["stage"] = "ask_time"
-        await _ga_bc_ask_time(message, uid)
+        text = message.caption or ""
+
+        messages: List[Dict[str, Any]] = state.get("messages") or []
+        messages.append({"text": text, "media": media})
+        state["messages"] = messages
+
+        await message.answer(
+            f"Пост #{len(messages)} сохранён (медиа + подпись).\n\n"
+            "Отправь следующий пост (текст или медиа), "
+            "или нажми «Перейти к настройке времени».",
+            reply_markup=_ga_bc_finish_msgs_kb(),
+        )
         return
 
-    # если это не часть рассылки — игнорируем
+    # если это не часть кампании — игнорируем
 
 
 # ---------------------------------------------------------------------------

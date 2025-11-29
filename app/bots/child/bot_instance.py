@@ -1580,15 +1580,22 @@ def make_child_router(tenant_id: int) -> Router:
 
     @router.callback_query(F.data == "signal:open_app")
     async def cb_signal_open_app(call: CallbackQuery) -> None:
-        # исторический callback, оставлен для совместимости;
-        # сейчас ничего не делает, чтобы не спамить лишними сообщениями.
+        # исторический callback, но теперь используем его чтобы выслать
+        # свежее окно "Доступ открыт" с web_app-кнопкой
         user = call.from_user
         if user is None:
             await call.answer()
             return
 
+        tenant = await _get_tenant(tenant_id)
+        if tenant is None:
+            await call.answer("Тенант не найден", show_alert=True)
+            return
+
         lang = await _get_user_lang(tenant_id, user.id) or settings.lang_default
-        await _open_miniapp(call.message, lang)
+
+        # шлём НОВОЕ окно "Доступ открыт" с web_app
+        await _send_access_open_screen(call.message, tenant, lang)
         await call.answer()
 
     # ---------- админка ----------

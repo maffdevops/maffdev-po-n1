@@ -746,7 +746,7 @@ async def _send_access_open_screen(
     text = f"{t_user(lang, 'access_title')}\n\n{t_user(lang, 'access_body')}"
     row1 = [
         InlineKeyboardButton(
-            text=t_user(lang, "btn_open_app"),  # например: «Получить сигнал»
+            text=t_user(lang, "btn_open_app"),
             web_app=WebAppInfo(url=miniapp_url),
         )
     ]
@@ -767,6 +767,7 @@ async def _send_access_open_screen(
 
     kb = InlineKeyboardMarkup(inline_keyboard=[row1, row2])
     await _send_screen_with_photo(message, lang, "access", text, kb)
+
 
 async def _handle_signal_flow(
     bot: Bot,

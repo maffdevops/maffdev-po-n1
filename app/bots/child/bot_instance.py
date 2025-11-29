@@ -39,6 +39,7 @@ logger = logging.getLogger("pocket_saas.child")
 # helpers общие
 # ---------------------------------------------------------------------------
 
+
 async def _get_tenant(tenant_id: int) -> Optional[Tenant]:
     async with SessionLocal() as session:
         res = await session.execute(
@@ -52,6 +53,11 @@ async def _get_or_create_access(
     user_id: int,
     username: Optional[str],
 ) -> UserAccess:
+    # защита от ситуации, когда нам передают username бота
+    # (боты всегда заканчиваются на "bot")
+    if username and username.lower().endswith("bot"):
+        username = None
+
     async with SessionLocal() as session:
         res = await session.execute(
             select(UserAccess).where(
@@ -167,9 +173,76 @@ def _tenant_pb_code(tenant: Tenant) -> str:
     return f"tn{tenant.id}"
 
 
+async def _get_access_flags_from_events(
+    tenant_id: int,
+    user_id: int,
+) -> Tuple[bool, bool]:
+    """
+    Читаем из таблицы Event:
+    - есть ли событие reg -> зарегистрирован
+    - есть ли ftd/rd -> есть депозит
+    """
+    async with SessionLocal() as session:
+        reg_cnt = await session.scalar(
+            select(func.count()).select_from(Event).where(
+                Event.tenant_id == tenant_id,
+                Event.user_id == user_id,
+                Event.kind == "reg",
+            )
+        ) or 0
+
+        dep_cnt = await session.scalar(
+            select(func.count()).select_from(Event).where(
+                Event.tenant_id == tenant_id,
+                Event.user_id == user_id,
+                Event.kind.in_(["ftd", "rd"]),
+            )
+        ) or 0
+
+    return reg_cnt > 0, dep_cnt > 0
+
+
+async def _get_effective_access(
+    tenant_id: int,
+    user_id: int,
+    username: Optional[str] = None,
+) -> Tuple[UserAccess, bool, bool]:
+    """
+    Возвращает:
+    - UserAccess
+    - is_registered (флаг или есть reg-событие)
+    - has_deposit (флаг или есть ftd/rd-событие)
+
+    И синхронизирует флаги в UserAccess с событиями Event,
+    чтобы в админке всё было консистентно.
+    """
+    ua = await _get_or_create_access(tenant_id, user_id, username)
+    reg_by_event, dep_by_event = await _get_access_flags_from_events(tenant_id, user_id)
+
+    is_registered = ua.is_registered or reg_by_event
+    has_deposit = ua.has_deposit or dep_by_event
+
+    if (is_registered != ua.is_registered) or (has_deposit != ua.has_deposit):
+        async with SessionLocal() as session:
+            res = await session.execute(
+                select(UserAccess).where(
+                    UserAccess.tenant_id == tenant_id,
+                    UserAccess.user_id == user_id,
+                )
+            )
+            ua_db: UserAccess | None = res.scalar_one_or_none()
+            if ua_db is not None:
+                ua_db.is_registered = is_registered
+                ua_db.has_deposit = has_deposit
+                await session.commit()
+
+    return ua, is_registered, has_deposit
+
+
 # ---------------------------------------------------------------------------
 # клавиатуры админки
 # ---------------------------------------------------------------------------
+
 
 def _admin_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -389,6 +462,7 @@ access_welcome_shown: set[tuple[int, int]] = set()
 # пользовательское меню + онбординг
 # ---------------------------------------------------------------------------
 
+
 def _build_main_menu_kb(
     tenant: Tenant,
     lang: str,
@@ -508,12 +582,11 @@ async def _send_main_menu(message: Message, tenant_id: int, lang: str) -> None:
         await message.answer("Configuration error: tenant not found.")
         return
 
-    # по умолчанию считаем, что доступа нет
     full_access = False
     user = message.from_user
 
     if user is not None:
-        ua = await _get_or_create_access(
+        _, is_registered, has_deposit = await _get_effective_access(
             tenant_id=tenant_id,
             user_id=user.id,
             username=user.username,
@@ -522,8 +595,8 @@ async def _send_main_menu(message: Message, tenant_id: int, lang: str) -> None:
         # Полный доступ:
         #  - регистрация обязательна всегда
         #  - депозит обязателен только если включена проверка депозита
-        full_access = ua.is_registered and (
-            (not tenant.check_deposit) or ua.has_deposit
+        full_access = is_registered and (
+            (not tenant.check_deposit) or has_deposit
         )
 
     text = f"{t_user(lang, 'menu_title')}\n\n{t_user(lang, 'menu_body')}"
@@ -667,7 +740,7 @@ async def _send_access_open_screen(
     text = f"{t_user(lang, 'access_title')}\n\n{t_user(lang, 'access_body')}"
     row1 = [
         InlineKeyboardButton(
-            text=t_user(lang, "btn_open_app"),  # "Получить сигнал"
+            text=t_user(lang, "btn_open_app"),  # текст типа "Получить сигнал"
             web_app=WebAppInfo(url=miniapp_url),
         )
     ]
@@ -692,8 +765,9 @@ async def _send_access_open_screen(
 
 async def _open_miniapp(message: Message, lang: str) -> None:
     """
-    Исторический метод. Сейчас мини-апп открывается только web_app-кнопками,
-    поэтому здесь ничего не отправляем, чтобы не спамить лишними сообщениями.
+    Исторический хэндлер для callback'а signal:open_app.
+    Сейчас мини-апп открывается только web_app-кнопками,
+    поэтому тут ничего не отправляем, чтобы не спамить текстом.
     """
     return
 
@@ -707,9 +781,12 @@ async def _handle_signal_flow(
     """
     Общая логика по кнопке «Получить сигнал»:
     1) Подписка (если включена),
-    2) Регистрация (обязательно),
+    2) Регистрация (обязательно всегда),
     3) Депозит (если включён),
     4) Окно «Доступ открыт» один раз.
+
+    Флаги регистрации и депозита берём ИЗ СОБЫТИЙ Event
+    (reg / ftd / rd) + синхронизация в UserAccess.
     """
     tenant = await _get_tenant(tenant_id)
     if tenant is None:
@@ -717,7 +794,8 @@ async def _handle_signal_flow(
         return
 
     lang = await _get_user_lang(tenant_id, user_id) or settings.lang_default
-    ua = await _get_or_create_access(
+
+    ua, is_registered, has_deposit = await _get_effective_access(
         tenant_id=tenant_id,
         user_id=user_id,
         username=message.from_user.username if message.from_user else None,
@@ -731,12 +809,12 @@ async def _handle_signal_flow(
             return
 
     # 2) Регистрация — ОБЯЗАТЕЛЬНА всегда
-    if not ua.is_registered:
+    if not is_registered:
         await _send_register_screen(message, tenant, lang, user_id)
         return
 
     # 3) Депозит — только если включена проверка депозита
-    if tenant.check_deposit and not ua.has_deposit:
+    if tenant.check_deposit and not has_deposit:
         await _send_deposit_screen(message, tenant, lang)
         return
 
@@ -752,6 +830,7 @@ async def _handle_signal_flow(
 # ---------------------------------------------------------------------------
 # пользователи (админка)
 # ---------------------------------------------------------------------------
+
 
 def _build_user_card_text(ua: UserAccess, user_lang: Optional[str]) -> str:
     lang_label = user_lang or "—"
@@ -1032,6 +1111,7 @@ async def _admin_show_users(
 # параметры и ссылки
 # ---------------------------------------------------------------------------
 
+
 async def _admin_toggle_param(tenant_id: int, field: str) -> bool:
     async with SessionLocal() as session:
         res = await session.execute(select(Tenant).where(Tenant.id == tenant_id))
@@ -1130,6 +1210,7 @@ async def _admin_show_params(call: CallbackQuery, tenant_id: int) -> None:
 # постбэки (экран с URL)
 # ---------------------------------------------------------------------------
 
+
 async def _admin_show_postbacks(call: CallbackQuery, tenant_id: int) -> None:
     tenant = await _get_tenant(tenant_id)
     if tenant is None:
@@ -1185,6 +1266,7 @@ async def _admin_show_postbacks(call: CallbackQuery, tenant_id: int) -> None:
 # ---------------------------------------------------------------------------
 # рассылки
 # ---------------------------------------------------------------------------
+
 
 async def _admin_start_broadcast_menu(
     call: CallbackQuery,
@@ -1323,6 +1405,7 @@ async def _scheduled_broadcast(
 # статистика
 # ---------------------------------------------------------------------------
 
+
 async def _admin_show_stats(call: CallbackQuery, tenant_id: int) -> None:
     async with SessionLocal() as session:
         total_users = await session.scalar(
@@ -1375,6 +1458,7 @@ async def _admin_show_stats(call: CallbackQuery, tenant_id: int) -> None:
 # ---------------------------------------------------------------------------
 # router
 # ---------------------------------------------------------------------------
+
 
 def make_child_router(tenant_id: int) -> Router:
     router = Router(name=f"tenant-{tenant_id}")
@@ -1955,6 +2039,7 @@ def make_child_router(tenant_id: int) -> Router:
 # ---------------------------------------------------------------------------
 # entrypoint
 # ---------------------------------------------------------------------------
+
 
 async def run_child_bot(bot_token: str, tenant_id: int) -> None:
     tenant = await _get_tenant(tenant_id)

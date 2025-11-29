@@ -6,6 +6,7 @@ from fastapi import APIRouter, Query
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.exceptions import TelegramBadRequest, TelegramForbidden
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -59,17 +60,46 @@ async def _send_screen_with_photo_to_user(
     text: str,
     kb: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
+    """
+    Отправка экрана юзеру из postback-сервиса.
+    Любые ошибки Telegram (chat not found / blocked / etc)
+    НЕ должны ломать обработчик постбэка.
+    """
+    # как и в детском боте, пока используем assets/en
     path = os.path.join("assets", "en", f"{screen}.jpg")
 
-    if os.path.exists(path):
-        try:
-            photo = FSInputFile(path)
-            await bot.send_photo(chat_id, photo, caption=text, reply_markup=kb)
-            return
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Failed to send photo %s: %s", path, e)
+    try:
+        if os.path.exists(path):
+            try:
+                photo = FSInputFile(path)
+                await bot.send_photo(chat_id, photo, caption=text, reply_markup=kb)
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Failed to send photo %s to chat %s: %s",
+                    path,
+                    chat_id,
+                    e,
+                )
 
-    await bot.send_message(chat_id, text, reply_markup=kb)
+        # если фотка не отправилась или её нет — шлём просто текст
+        await bot.send_message(chat_id, text, reply_markup=kb)
+
+    except (TelegramBadRequest, TelegramForbidden) as e:
+        # сюда попадает, например, "Bad Request: chat not found"
+        logger.warning(
+            "Cannot deliver screen %s to chat %s: %s",
+            screen,
+            chat_id,
+            e,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception(
+            "Unexpected error sending screen %s to chat %s: %s",
+            screen,
+            chat_id,
+            e,
+        )
 
 
 async def _send_deposit_screen_to_user(

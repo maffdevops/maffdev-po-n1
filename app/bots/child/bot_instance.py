@@ -469,7 +469,7 @@ def _build_main_menu_kb(
     full_access: bool,
 ) -> InlineKeyboardMarkup:
     support_url = tenant.support_url or settings.default_support_url
-    miniapp_url = settings.miniapp_url or "https://jeempocket.github.io/mini-app/"
+    miniapp_url = settings.miniapp_url or "https://jeempocket.github.io/nestmiap/"
 
     row1 = [
         InlineKeyboardButton(
@@ -741,7 +741,7 @@ async def _send_access_open_screen(
     - кнопка «Назад в меню».
     """
     support_url = tenant.support_url or settings.default_support_url
-    miniapp_url = settings.miniapp_url or "https://jeempocket.github.io/mini-app/"
+    miniapp_url = settings.miniapp_url or "https://jeempocket.github.io/nestmiap/"
 
     text = f"{t_user(lang, 'access_title')}\n\n{t_user(lang, 'access_body')}"
     row1 = [

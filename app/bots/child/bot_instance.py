@@ -1910,6 +1910,12 @@ def make_child_router(tenant_id: int) -> Router:
         if not text:
             return
 
+        # --- ФИКС /start: если пришёл /start текстом, вызываем cmd_start ---
+        if text.startswith("/start"):
+            await cmd_start(message)
+            return
+        # -------------------------------------------------------------------
+
         user = message.from_user
         if user is None:
             return

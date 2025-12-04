@@ -1047,7 +1047,7 @@ async def _admin_show_users(
         lines.append("Пользователей пока нет.")
     text = "\n".join(lines)
 
-    kb_rows: List[InlineKeyboardButton] | List[List[InlineKeyboardButton]] = []
+    kb_rows: List[List[InlineKeyboardButton]] = []
 
     kb_rows.append(
         [
@@ -1101,7 +1101,7 @@ async def _admin_show_users(
         ]
     )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)  # type: ignore[arg-type]
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
     await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
@@ -1464,6 +1464,26 @@ def make_child_router(tenant_id: int) -> Router:
     router = Router(name=f"tenant-{tenant_id}")
 
     # ---------- стандартные команды ----------
+
+    @router.message(CommandStart())
+    async def cmd_start(message: Message) -> None:
+        user = message.from_user
+        if user is None:
+            return
+
+        await _get_or_create_access(
+            tenant_id=tenant_id,
+            user_id=user.id,
+            username=user.username,
+        )
+
+        lang = await _get_user_lang(tenant_id, user.id)
+
+        if lang is None:
+            await _send_lang_menu(message)
+            return
+
+        await _send_main_menu(message, tenant_id, lang)
 
     @router.message(Command("lang"))
     async def cmd_lang(message: Message) -> None:
@@ -1893,24 +1913,6 @@ def make_child_router(tenant_id: int) -> Router:
         user = message.from_user
         if user is None:
             return
-
-        # ---------- /start как текст/команда ----------
-        if text.startswith("/start"):
-            await _get_or_create_access(
-                tenant_id=tenant_id,
-                user_id=user.id,
-                username=user.username,
-            )
-
-            lang = await _get_user_lang(tenant_id, user.id)
-
-            if lang is None:
-                await _send_lang_menu(message)
-            else:
-                await _send_main_menu(message, tenant_id, lang)
-
-            return
-        # ----------------------------------------------
 
         # поиск пользователя
         tid_search = search_user_waiting.pop(user.id, None)
